@@ -37,4 +37,17 @@ class Emoji {
       createdAt: json['created_at'] ?? 0,
     );
   }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'uid': uid,
+        'username': username,
+        'display_name': displayName,
+        'avatar_url': avatarUrl,
+        'media_url': mediaUrl,
+        'thumb_url': thumbUrl,
+        'likes': likes,
+        'is_liked': isLiked,
+        'created_at': createdAt,
+      };
 }

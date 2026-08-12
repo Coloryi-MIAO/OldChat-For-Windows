@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class Moment {
   final String id;
   final String uid;
@@ -31,23 +33,39 @@ class Moment {
 
   factory Moment.fromJson(Map<String, dynamic> json) {
     final commentsList = json['comments_list'] ?? json['comment_list'];
-    final rawImages = json['image_urls'] ?? json['images'] ?? json['media_urls'] ?? json['media'];
     final urls = <String>[];
     void addImage(dynamic item) {
+      if (item == null) return;
       if (item is List) {
         for (final nested in item) addImage(nested);
         return;
       }
-      final value = item is Map
-          ? (item['url'] ?? item['image_url'] ?? item['media_url'] ?? item['src'])
-          : item;
-      if (value is String && value.trim().isNotEmpty && !urls.contains(value.trim())) {
-        urls.add(value.trim());
+      if (item is Map) {
+        addImage(item['url'] ?? item['image_url'] ?? item['media_url'] ?? item['src'] ?? item['download_url'] ?? item['file_url']);
+        return;
+      }
+      if (item is String) {
+        final value = item.trim();
+        if (value.isEmpty) return;
+        try {
+          final decoded = jsonDecode(value);
+          if (decoded is List || decoded is Map) {
+            addImage(decoded);
+            return;
+          }
+        } catch (_) {}
+        if (!urls.contains(value)) urls.add(value);
       }
     }
-    addImage(rawImages);
-    addImage(json['image_url'] ?? json['media_url'] ?? json['mediaUrl'] ??
+    addImage(json['image_urls']);
+    addImage(json['images']);
+    addImage(json['media_urls']);
+    addImage(json['media']);
+    addImage(json['image_url']);
+    addImage(json['media_url'] ?? json['mediaUrl'] ??
         json['download_url'] ?? json['file_url'] ?? json['cover_url']);
+    addImage(json['attachments']);
+    addImage(json['media_list']);
     return Moment(
       id: json['id'] ?? '',
       uid: json['uid'] ?? json['from_uid'] ?? '',

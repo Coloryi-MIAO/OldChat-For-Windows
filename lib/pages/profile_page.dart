@@ -7,6 +7,8 @@ import 'package:provider/provider.dart';
 import '../services/auth_service.dart';
 import '../services/api_service.dart';
 import '../utils/url_helper.dart';
+import '../widgets/cached_image.dart';
+import '../widgets/image_viewer.dart';
 import '../pages/moments_page.dart';
 
 class ProfilePage extends StatefulWidget {
@@ -155,6 +157,31 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
+  Future<void> _updateTitle(String newTitle) async {
+    try {
+      final value = newTitle.trim();
+      await ApiService().updateProfile({'user_title': value});
+      if (mounted) setState(() => _profile?['user_title'] = value);
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('称号已更新')));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('更新失败: $e')));
+    }
+  }
+
+  Future<void> _updateUid(String newUid) async {
+    final value = newUid.trim();
+    if (value.isEmpty) return;
+    try {
+      await ApiService().updateUid(value);
+      if (mounted) {
+        setState(() => _profile?['uid'] = value);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('UID 已更新')));
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('UID 更新失败：$e')));
+    }
+  }
+
   Future<void> _updateSignature(String newSignature) async {
     try {
       final api = ApiService();
@@ -270,6 +297,12 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
+  Future<void> _logout() async {
+    await context.read<AuthService>().clear();
+    if (!mounted) return;
+    Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false);
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -335,15 +368,19 @@ class _ProfilePageState extends State<ProfilePage> {
                                   '未命名',
                               onSave: _updateDisplayName,
                               isTitle: true),
+                          _buildEditableField(
+                              label: '称号',
+                              value: _profile!['user_title'] ?? '点击添加称号',
+                              onSave: _updateTitle,
+                              textStyle: const TextStyle(fontSize: 13, color: Colors.deepPurple)),
                           const SizedBox(height: 4),
                           _buildEditableField(
                               label: 'UID',
                               value: _profile!['uid'] ?? '',
-                              onSave: (v) {},
-                              readOnly: true,
+                              onSave: _updateUid,
                               textStyle: const TextStyle(
                                   fontSize: 13, color: Colors.grey)),
-                          const SizedBox(height: 4),
+                          const SizedBox(height: 8),
                           _buildEditableField(
                               label: '签名',
                               value: _profile!['signature'] ?? '点击添加签名',
@@ -402,73 +439,17 @@ class _ProfilePageState extends State<ProfilePage> {
                           ),
                           const SizedBox(height: 24),
                           const Divider(),
-                          const SizedBox(height: 16),
-                          _buildActionSection(
-                            title: '添加好友',
-                            child: Row(
-                              children: [
-                                Expanded(
-                                    child: TextField(
-                                        controller: _friendUidController,
-                                        decoration: const InputDecoration(
-                                            hintText: '输入对方 UID',
-                                            border: OutlineInputBorder(
-                                                borderRadius: BorderRadius.all(
-                                                    Radius.circular(20))),
-                                            contentPadding:
-                                                EdgeInsets.symmetric(
-                                                    horizontal: 16,
-                                                    vertical: 10)),
-                                        onSubmitted: (v) {
-                                          if (v.trim().isNotEmpty) _addFriend(uid: v);
-                                        })),
-                                const SizedBox(width: 8),
-                                ElevatedButton(
-                                    onPressed: () => _addFriend(uid: _friendUidController.text),
-                                    style: ElevatedButton.styleFrom(
-                                        backgroundColor: primaryColor,
-                                        foregroundColor: Colors.white,
-                                        shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(20))),
-                                    child: const Text('添加')),
-                              ],
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              onPressed: _logout,
+                              icon: const Icon(Icons.logout, color: Colors.red),
+                              label: const Text('退出登录', style: TextStyle(color: Colors.red)),
+                              style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.red)),
                             ),
                           ),
                           const SizedBox(height: 16),
-                          _buildActionSection(
-                            title: '加入群聊',
-                            child: Row(
-                              children: [
-                                Expanded(
-                                    child: TextField(
-                                        controller: _groupIdController,
-                                        decoration: const InputDecoration(
-                                            hintText: '输入群聊 ID',
-                                            border: OutlineInputBorder(
-                                                borderRadius: BorderRadius.all(
-                                                    Radius.circular(20))),
-                                            contentPadding:
-                                                EdgeInsets.symmetric(
-                                                    horizontal: 16,
-                                                    vertical: 10)),
-                                        onSubmitted: (v) {
-                                          if (v.trim().isNotEmpty) _joinGroup(groupId: v);
-                                        })),
-                                const SizedBox(width: 8),
-                                ElevatedButton(
-                                    onPressed: () => _joinGroup(groupId: _groupIdController.text),
-                                    style: ElevatedButton.styleFrom(
-                                        backgroundColor: primaryColor,
-                                        foregroundColor: Colors.white,
-                                        shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(20))),
-                                    child: const Text('加入')),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
                           _buildMomentsSection(primaryColor),
                         ],
                       ),
@@ -478,34 +459,80 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Widget _buildAvatarSection(Color primaryColor) {
     final avatarUrl = _profile?['avatar_url'];
+    final avatarText = avatarUrl?.toString().trim() ?? '';
+    final avatarUrls = <String>[];
+    final rawAvatarUrls = _profile?['avatar_urls'] ?? _profile?['avatars'];
+    if (rawAvatarUrls is List) {
+      avatarUrls.addAll(rawAvatarUrls.map((value) => value.toString()));
+    }
+    if (avatarText.isNotEmpty && !avatarUrls.contains(avatarText)) {
+      avatarUrls.insert(0, avatarText);
+    }
     return GestureDetector(
-      onTap: _uploadingAvatar ? null : _updateAvatar,
+      onTap: avatarText.isEmpty || _uploadingAvatar
+          ? (_uploadingAvatar ? null : _updateAvatar)
+          : () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => ImageViewer(
+                    imageUrl: avatarText,
+                    imageUrls: avatarUrls,
+                  ),
+                ),
+              ),
       child: Stack(
         alignment: Alignment.center,
         children: [
           CircleAvatar(
             radius: 50,
-            backgroundImage: avatarUrl != null && avatarUrl.isNotEmpty
-                ? NetworkImage(resolveMediaUrl(avatarUrl))
-                : null,
+            backgroundImage: null,
             child: avatarUrl == null || avatarUrl.isEmpty
                 ? const Icon(Icons.person, size: 46)
-                : null,
-            onBackgroundImageError: (_, __) {},
+                : ClipOval(
+                    child: CachedImage(
+                      resolveMediaUrl(avatarUrl),
+                      width: 100,
+                      height: 100,
+                      cacheWidth: 240,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const Icon(Icons.person, size: 46),
+                    ),
+                  ),
           ),
           if (!_uploadingAvatar)
-            Container(
-              width: 100,
-              height: 100,
-              decoration: BoxDecoration(
-                  shape: BoxShape.circle, color: Colors.black.withOpacity(0.4)),
-              child:
-                  const Icon(Icons.camera_alt, color: Colors.white, size: 28),
+            Positioned(
+              right: 0,
+              bottom: 0,
+              child: Material(
+                color: primaryColor,
+                shape: const CircleBorder(),
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: _updateAvatar,
+                  child: const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Icon(Icons.camera_alt, color: Colors.white, size: 18),
+                  ),
+                ),
+              ),
             )
           else
             const Center(child: CircularProgressIndicator(color: Colors.white)),
         ],
       ),
+    );
+  }
+
+  Widget _buildTitleBadge(dynamic rawTitle) {
+    final title = rawTitle?.toString().trim() ?? '';
+    if (title.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(title, style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer, fontSize: 12)),
     );
   }
 

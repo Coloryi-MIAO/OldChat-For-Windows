@@ -1,5 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:cryptography/cryptography.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/status.dart' as status;
@@ -7,9 +10,11 @@ import '../utils/constants.dart';
 import '../models/message.dart';
 import 'auth_service.dart';
 import 'api_service.dart';
+import 'ws_session_service.dart';
 
 typedef OnMessageCallback = void Function(Message message);
 typedef OnEventCallback = void Function(String type, Map<String, dynamic> data);
+typedef OnRecallCallback = void Function(String messageId, String displayName);
 
 class WebSocketService {
   static final WebSocketService _instance = WebSocketService._internal();
@@ -25,7 +30,7 @@ class WebSocketService {
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
   static const int _maxReconnectAttempts = 1000000;
-  static const Duration _reconnectDelay = Duration(seconds: 1);
+  static const Duration _reconnectDelay = Duration(seconds: 5);
   bool _isReconnecting = false;
   int _refreshAttempts = 0;
   static const int _maxRefreshAttempts = 2;
@@ -33,11 +38,21 @@ class WebSocketService {
   OnEventCallback? onEvent;
   final Set<OnMessageCallback> _directListeners = <OnMessageCallback>{};
   final Set<OnMessageCallback> _groupListeners = <OnMessageCallback>{};
+  final Set<OnRecallCallback> _recallListeners = <OnRecallCallback>{};
 
-  void addDirectListener(OnMessageCallback listener) => _directListeners.add(listener);
-  void removeDirectListener(OnMessageCallback listener) => _directListeners.remove(listener);
-  void addGroupListener(OnMessageCallback listener) => _groupListeners.add(listener);
-  void removeGroupListener(OnMessageCallback listener) => _groupListeners.remove(listener);
+  void addRecallListener(OnRecallCallback listener) =>
+      _recallListeners.add(listener);
+  void removeRecallListener(OnRecallCallback listener) =>
+      _recallListeners.remove(listener);
+
+  void addDirectListener(OnMessageCallback listener) =>
+      _directListeners.add(listener);
+  void removeDirectListener(OnMessageCallback listener) =>
+      _directListeners.remove(listener);
+  void addGroupListener(OnMessageCallback listener) =>
+      _groupListeners.add(listener);
+  void removeGroupListener(OnMessageCallback listener) =>
+      _groupListeners.remove(listener);
 
   void _emit(Set<OnMessageCallback> listeners, Message message) {
     for (final listener in List<OnMessageCallback>.from(listeners)) {
@@ -49,7 +64,8 @@ class WebSocketService {
     }
   }
 
-  void connect() {
+  Future<void> connect() async {
+    if (Platform.isWindows) return;
     if (_connected || _connecting || _channel != null) return;
     final token = _auth.token;
     if (token == null || token.isEmpty) {
@@ -62,25 +78,30 @@ class WebSocketService {
     final generation = ++_connectionGeneration;
 
     try {
+      final session = WsSessionService();
+      await session.ensureReady();
       final baseUri = Uri.parse(Constants.baseUrl);
       final wsUri = baseUri.replace(
         scheme: baseUri.scheme == 'https' ? 'wss' : 'ws',
         path: Constants.wsPath,
-        queryParameters: const <String, String>{},
+        queryParameters: {
+          'token': token,
+          if (session.sessionId != null) 'sid': session.sessionId!,
+        },
       );
       late final IOWebSocketChannel channel;
       channel = IOWebSocketChannel.connect(
         wsUri,
         headers: {'Authorization': 'Bearer $token'},
         pingInterval: const Duration(seconds: 20),
-        connectTimeout: const Duration(seconds: 10),
       );
       _channel = channel;
       channel.stream.listen(
         (data) => _handleMessage(data),
         onDone: () => _handleDisconnected(channel, generation),
         onError: (error) {
-          final authError = error.toString().contains('401') ||
+          final authError =
+              error.toString().contains('401') ||
               error.toString().contains('Unauthorized');
           _handleDisconnected(channel, generation, error, false);
           if (authError) {
@@ -90,26 +111,16 @@ class WebSocketService {
           }
         },
       );
-      unawaited(_markReady(channel, generation));
-    } catch (e) {
-      _connecting = false;
-      _channel = null;
-      print('WebSocket: Connection failed - $e');
-      _scheduleReconnect();
-    }
-  }
-
-  Future<void> _markReady(IOWebSocketChannel channel, int generation) async {
-    try {
-      await channel.ready;
-      if (!identical(_channel, channel)) return;
       _connected = true;
       _reconnectAttempts = 0;
       _refreshAttempts = 0;
       _isReconnecting = false;
       print('WebSocket: Connected');
     } catch (e) {
-      _handleDisconnected(channel, generation, e);
+      _connecting = false;
+      _channel = null;
+      print('WebSocket: Connection failed - $e');
+      _scheduleReconnect();
     }
   }
 
@@ -119,10 +130,12 @@ class WebSocketService {
     Object? error,
     bool schedule = true,
   ]) {
-    if (generation != _connectionGeneration || !identical(_channel, channel)) return;
+    if (generation != _connectionGeneration || !identical(_channel, channel))
+      return;
     _channel = null;
     _connected = false;
     _connecting = false;
+    WsSessionService().reset();
     if (error != null) print('WebSocket: Error - $error');
     print('WebSocket: Disconnected');
     if (_shouldReconnect && schedule) _scheduleReconnect();
@@ -187,11 +200,15 @@ class WebSocketService {
   }
 
   void _scheduleReconnect() {
-    if (!_shouldReconnect || _reconnectTimer?.isActive == true || _connecting) return;
+    if (!_shouldReconnect || _reconnectTimer?.isActive == true || _connecting)
+      return;
     _reconnectAttempts++;
     final exponent = _reconnectAttempts > 4 ? 4 : _reconnectAttempts - 1;
     final delay = Duration(
-      milliseconds: (_reconnectDelay.inMilliseconds * (1 << exponent)).clamp(1000, 30000),
+      milliseconds: (_reconnectDelay.inMilliseconds * (1 << exponent)).clamp(
+        1000,
+        30000,
+      ),
     );
     print('WebSocket: ${delay.inSeconds}秒后重连 (尝试 $_reconnectAttempts)');
     _reconnectTimer = Timer(delay, () {
@@ -218,30 +235,81 @@ class WebSocketService {
 
   bool get isConnected => _connected;
 
-  void _handleMessage(dynamic data) {
+  Future<void> _handleMessage(dynamic data) async {
     try {
       dynamic decoded = data;
-      if (decoded is String) decoded = jsonDecode(decoded);
+      if (decoded is String) {
+        final decrypted = await WsSessionService().decrypt(decoded);
+        decoded = decrypted == null
+            ? jsonDecode(decoded)
+            : jsonDecode(decrypted);
+      }
       if (decoded is! Map) return;
 
       final envelope = Map<String, dynamic>.from(decoded as Map);
       var type = envelope['type']?.toString().toLowerCase();
-      dynamic rawPayload = envelope['data'] ?? envelope['message'] ?? envelope['payload'] ?? envelope;
+      if (type == null || type.isEmpty) {
+        type = envelope['event']?.toString().toLowerCase();
+      }
+      dynamic rawPayload =
+          envelope['data'] ??
+          envelope['message'] ??
+          envelope['payload'] ??
+          envelope['data_payload'] ??
+          envelope;
       if (rawPayload is String) rawPayload = jsonDecode(rawPayload);
       if (rawPayload is! Map) return;
       var payload = Map<String, dynamic>.from(rawPayload as Map);
       final nestedType = payload['type']?.toString().toLowerCase();
-      if ((type == null || type == 'message' || type == 'event') && nestedType != null) {
+      if ((type == null || type == 'message' || type == 'event') &&
+          nestedType != null) {
         type = nestedType;
       }
       if (payload['message'] is Map) {
         payload = Map<String, dynamic>.from(payload['message'] as Map);
       }
 
-      final normalizedType = (type ?? '').replaceAll('-', '_').replaceAll('.', '_');
-      final isGroup = normalizedType == 'group_message' || normalizedType == 'new_group_message' ||
+      final normalizedType = (type ?? '')
+          .replaceAll('-', '_')
+          .replaceAll('.', '_')
+          .toLowerCase();
+      if (normalizedType.contains('recall') ||
+          normalizedType.contains('recalled') ||
+          normalizedType == 'message_deleted') {
+        final messageId = (payload['message_id'] ?? payload['id'] ?? '')
+            .toString();
+        if (messageId.isNotEmpty) {
+          final displayName =
+              (payload['from_name'] ??
+                      payload['display_name'] ??
+                      payload['recall_by_name'] ??
+                      payload['from_uid'] ??
+                      '对方')
+                  .toString();
+          onEvent?.call(normalizedType, payload);
+          for (final listener in List<OnRecallCallback>.from(
+            _recallListeners,
+          )) {
+            try {
+              listener(messageId, displayName);
+            } catch (error) {
+              print('WebSocket: recall listener error - $error');
+            }
+          }
+        }
+        return;
+      }
+      final isGroup = normalizedType == 'group_message' ||
+          normalizedType == 'new_group_message' ||
+          normalizedType == 'group_message_new' ||
+          (normalizedType.contains('group_message') &&
+              normalizedType.endsWith('_new')) ||
           (normalizedType == 'new_message' && payload['group_id'] != null);
-      final isDirect = normalizedType == 'direct_message' || normalizedType == 'new_direct_message' ||
+      final isDirect = normalizedType == 'direct_message' ||
+          normalizedType == 'new_direct_message' ||
+          normalizedType == 'direct_message_new' ||
+          (normalizedType.contains('direct_message') &&
+              normalizedType.endsWith('_new')) ||
           (normalizedType == 'new_message' && payload['group_id'] == null);
       if ((!isDirect && !isGroup) || payload['id'] == null) return;
 

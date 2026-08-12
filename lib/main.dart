@@ -1,7 +1,7 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'services/image_cache_service.dart';
-import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:provider/provider.dart';
 import 'package:windows_single_instance/windows_single_instance.dart';
@@ -12,6 +12,7 @@ import 'services/notification_service.dart';
 import 'services/audio_service.dart';
 import 'widgets/custom_title_bar.dart';
 import 'pages/login_page.dart';
+import 'pages/home_page.dart';
 import 'pages/profile_page.dart';
 import 'pages/user_profile_page.dart';
 import 'pages/moments_page.dart';
@@ -24,17 +25,21 @@ import 'pages/favorites_page.dart';
 import 'pages/about_page.dart';
 import 'pages/settings_page.dart';
 import 'pages/chat_page.dart';
+import 'pages/resource_plaza_page.dart';
+import 'pages/public_court_page.dart';
+import 'pages/tools_hub_page.dart';
 import 'utils/navigation.dart';
 import 'utils/constants.dart';
 import 'services/theme_service.dart';
+import 'services/update_service.dart';
 import 'theme/app_theme.dart';
+import 'widgets/update_dialog.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   ImageCacheService.configure();
-  VideoPlayerMediaKit.ensureInitialized(
-    windows: true,
-  );
+  VideoPlayerMediaKit.ensureInitialized(windows: true);
 
   // ★ 加载用户自定义 baseUrl
   await Constants.loadBaseUrl();
@@ -56,6 +61,7 @@ void main(List<String> args) async {
   await AudioService().init();
 
   // 窗口关闭事件监听
+  await windowManager.setPreventClose(true);
   windowManager.addListener(_WindowCloseListener());
 
   const windowOptions = WindowOptions(
@@ -81,57 +87,112 @@ void main(List<String> args) async {
 
   runApp(
     TrayManager(
-      child: MyApp(auth: auth, notificationService: notificationService, themeController: themeController),
+      child: MyApp(
+        auth: auth,
+        notificationService: notificationService,
+        themeController: themeController,
+      ),
     ),
   );
 }
 
-// 窗口关闭监听器
 class _WindowCloseListener extends WindowListener {
+  bool _handlingClose = false;
+  bool _minimizedToTray = false;
+
   @override
-  void onWindowEvent(String event) async {
-    if (event == 'close') {
-      final result = await _showExitDialog();
-      if (result == 2) {
-        await AuthService().clear();
-        await windowManager.destroy();
-        exit(0);
-      } else if (result == 1) {
-        await windowManager.hide();
-      }
-    }
+  void onWindowClose() {
+    if (_handlingClose || _minimizedToTray) return;
+    _handlingClose = true;
+    unawaited(_handleClose());
   }
 
-  Future<int> _showExitDialog() async {
-    final ctx = navigatorKey.currentContext;
-    if (ctx == null) return 0;
-    return await showDialog<int>(
-          context: ctx,
-          barrierDismissible: false,
-          builder: (dialogContext) => AlertDialog(
-            title: const Text('退出程序'),
-            content: const Text('确定要退出程序吗？'),
+  Future<void> _handleClose() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final confirm = prefs.getBool('close_confirm_enabled') ?? true;
+      final savedAction =
+          (prefs.getBool('close_minimize_to_tray') ?? false)
+              ? 'minimize'
+              : (prefs.getString('exit_close_action') ?? 'exit');
+      if (!confirm) {
+        await _applyCloseAction(savedAction == 'minimize');
+        return;
+      }
+
+      final context = navigatorKey.currentContext;
+      if (context == null || !context.mounted) {
+        await _applyCloseAction(savedAction == 'minimize');
+        return;
+      }
+      var dontShowAgain = false;
+      final action = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('关闭 OldChat'),
+            content: Row(
+              children: [
+                Checkbox(
+                  value: dontShowAgain,
+                  onChanged: (value) =>
+                      setDialogState(() => dontShowAgain = value ?? false),
+                ),
+                const Expanded(child: Text('不再提示')),
+              ],
+            ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(dialogContext, 0),
+                onPressed: () => Navigator.pop(dialogContext, 'cancel'),
                 child: const Text('取消'),
               ),
               TextButton(
-                onPressed: () => Navigator.pop(dialogContext, 1),
+                onPressed: () => Navigator.pop(dialogContext, 'minimize'),
                 child: const Text('最小化到托盘'),
               ),
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext, 2),
-                child: const Text('退出', style: TextStyle(color: Colors.red)),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, 'exit'),
+                child: const Text('直接关闭'),
               ),
             ],
           ),
-        ) ??
-        0;
+        ),
+      );
+      if (action == null || action == 'cancel') return;
+      if (dontShowAgain) {
+        await prefs.setBool('exit_dont_show_again', true);
+        await prefs.setBool('close_confirm_enabled', false);
+      }
+      await prefs.setString('exit_close_action', action);
+      await prefs.setBool('close_minimize_to_tray', action == 'minimize');
+      await _applyCloseAction(action == 'minimize');
+    } finally {
+      _handlingClose = false;
+    }
+  }
+
+  Future<void> _applyCloseAction(bool minimize) async {
+    if (minimize) {
+      _minimizedToTray = true;
+      await windowManager.setPreventClose(true);
+      await windowManager.hide();
+      return;
+    }
+    await windowManager.setPreventClose(false);
+    await AuthService().clear();
+    await windowManager.destroy();
+    exit(0);
   }
 
   @override
   void onWindowFocus() {}
+
+  @override
+  void onWindowEvent(String eventName) {
+    if (eventName == 'hide') _minimizedToTray = true;
+    if (eventName == 'show' || eventName == 'restore') _minimizedToTray = false;
+  }
   @override
   void onWindowBlur() {}
   @override
@@ -146,6 +207,96 @@ class _WindowCloseListener extends WindowListener {
   void onWindowResize() {}
   @override
   void onWindowMove() {}
+}
+
+class _StartupGate extends StatefulWidget {
+  final bool isLoggedIn;
+
+  const _StartupGate({required this.isLoggedIn});
+
+  @override
+  State<_StartupGate> createState() => _StartupGateState();
+}
+
+class _StartupGateState extends State<_StartupGate> {
+  bool _visible = true;
+  bool _updateChecked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future<void>.delayed(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _visible = false);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_checkAutomaticUpdate());
+    });
+  }
+
+  Future<void> _checkAutomaticUpdate() async {
+    if (_updateChecked || !widget.isLoggedIn || !mounted) return;
+    _updateChecked = true;
+    final prefs = await SharedPreferences.getInstance();
+    if (!(prefs.getBool(Constants.autoUpdateKey) ?? true) || !mounted) return;
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    if (!mounted) return;
+    try {
+      final service = UpdateService();
+      final release = await service.availableForCurrentWindows(UpdateChannel.stable);
+      if (!mounted || release == null) return;
+      final current = await service.currentVersion();
+      if (!mounted) return;
+      await UpdateDialog.show(
+        context,
+        release: release,
+        currentVersion: current,
+      );
+    } catch (error) {
+      debugPrint('[自动更新] 检查失败：$error');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        widget.isLoggedIn ? const HomePage() : const LoginPage(),
+        IgnorePointer(
+          ignoring: !_visible,
+          child: AnimatedOpacity(
+            opacity: _visible ? 1 : 0,
+            duration: const Duration(milliseconds: 360),
+            child: const ColoredBox(
+              color: Color(0xFFFFF5FA),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Image(
+                      image: AssetImage('assets/app_icon.png'),
+                      width: 72,
+                      height: 72,
+                    ),
+                    SizedBox(height: 14),
+                    Text(
+                      'OldChat',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    SizedBox(height: 10),
+                    SizedBox(width: 120, child: LinearProgressIndicator()),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -174,8 +325,11 @@ class MyApp extends StatelessWidget {
           navigatorObservers: [routeObserver],
           title: 'OldChat Desktop',
           debugShowCheckedModeBanner: false,
-          theme: AppTheme.build(pink: themeController.isPink),
-          home: const LoginPage(),
+          theme: AppTheme.build(
+            pink: themeController.isPink,
+            fontFamily: themeController.fontFamily,
+          ),
+          home: _StartupGate(isLoggedIn: auth.isLoggedIn),
           routes: {
             '/profile': (context) => const ProfilePage(),
             '/user_profile': (context) {
@@ -196,8 +350,9 @@ class MyApp extends StatelessWidget {
             '/about': (context) => const AboutPage(),
             '/settings': (context) => const SettingsPage(),
             '/chat': (context) {
-              final args = ModalRoute.of(context)!.settings.arguments
-                  as Map<String, String>;
+              final args =
+                  ModalRoute.of(context)!.settings.arguments
+                      as Map<String, String>;
               return ChatPage(
                 conversationId: args['uid'] ?? '',
                 type: 'direct',
@@ -205,13 +360,18 @@ class MyApp extends StatelessWidget {
                 embed: false,
               );
             },
+            '/resource_plaza': (context) => const ResourcePlazaPage(),
+            '/public_court': (context) => const PublicCourtPage(),
+            '/tools': (context) => const ToolsHubPage(),
+            '/more': (context) => const ToolsHubPage(more: true),
           },
           builder: (context, child) {
             final isLogin = ModalRoute.of(context)?.settings.name == '/';
             if (isLogin) return child!;
             return Column(
+              mainAxisSize: MainAxisSize.max,
               children: [
-                const CustomTitleBar(),
+                const SizedBox(height: 40, child: CustomTitleBar()),
                 Expanded(child: child!),
               ],
             );

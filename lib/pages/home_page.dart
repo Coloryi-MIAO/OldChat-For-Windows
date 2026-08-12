@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -48,6 +47,13 @@ class _HomePageState extends State<HomePage> {
   int _friendRequestCount = 0; // ★ 好友申请未读数
   Timer? _searchTimer;
   Timer? _unreadReloadTimer;
+  Timer? _systemNotificationTimer;
+  Timer? _realtimePollTimer;
+  bool _unreadPollInFlight = false;
+  bool _conversationPollInFlight = false;
+  bool _systemNotificationBaselineReady = false;
+  bool _systemNotificationPollInFlight = false;
+  final Set<String> _seenSystemNotificationIds = <String>{};
   String? _avatarUrl;
   final Set<String> _realtimeMessageIds = <String>{};
   final Map<String, int> _realtimeUnreadPending = <String, int>{};
@@ -60,6 +66,8 @@ class _HomePageState extends State<HomePage> {
     _loadConversations();
     _loadPinnedState();
     _loadUnreadCounts();
+    _startRealtimePolling();
+    _startSystemNotificationPolling();
     _setupWebSocket();
     _loadUserAvatar();
   }
@@ -94,6 +102,8 @@ class _HomePageState extends State<HomePage> {
     WebSocketService().removeGroupListener(_onNewMessage);
     _searchTimer?.cancel();
     _unreadReloadTimer?.cancel();
+    _systemNotificationTimer?.cancel();
+    _realtimePollTimer?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -169,19 +179,26 @@ class _HomePageState extends State<HomePage> {
     final userId = context.read<AuthService>().userId;
     if (msg.fromUid == userId) return;
 
-    final key = msg.groupId == null ? 'direct:${msg.fromUid}' : 'group:${msg.groupId}';
-    final isCurrentConversation = _currentConversation != null &&
+    final key = msg.groupId == null
+        ? 'direct:${msg.fromUid}'
+        : 'group:${msg.groupId}';
+    final isCurrentConversation =
+        _currentConversation != null &&
         _currentConversation!.id == (msg.groupId ?? msg.fromUid) &&
-        _currentConversation!.type == (msg.groupId == null ? 'direct' : 'group');
+        _currentConversation!.type ==
+            (msg.groupId == null ? 'direct' : 'group');
     setState(() {
       if (!isCurrentConversation) {
         _unreadCounts[key] = (_unreadCounts[key] ?? 0) + 1;
+        _realtimeUnreadPending[key] = _unreadCounts[key]!;
       }
       _totalUnread = _unreadCounts.values.fold(0, (sum, count) => sum + count);
       final all = [..._groups, ..._friends];
-      final index = all.indexWhere((conversation) =>
-          conversation.id == (msg.groupId ?? msg.fromUid) &&
-          conversation.type == (msg.groupId == null ? 'direct' : 'group'));
+      final index = all.indexWhere(
+        (conversation) =>
+            conversation.id == (msg.groupId ?? msg.fromUid) &&
+            conversation.type == (msg.groupId == null ? 'direct' : 'group'),
+      );
       if (index >= 0) {
         final conversation = all[index];
         final updated = Conversation(
@@ -205,14 +222,79 @@ class _HomePageState extends State<HomePage> {
 
     _unreadReloadTimer?.cancel();
     _unreadReloadTimer = Timer(const Duration(milliseconds: 500), () {
-      if (mounted) unawaited(_loadUnreadCounts(excludeKey: isCurrentConversation ? key : null));
+      if (mounted)
+        unawaited(
+          _loadUnreadCounts(excludeKey: isCurrentConversation ? key : null),
+        );
     });
-    NotificationService().showMessageNotification(
-      fromName: msg.fromUid,
-      message: msg.body,
-      conversationId: msg.groupId ?? msg.fromUid,
-      conversationType: msg.groupId != null ? 'group' : 'direct',
-    );
+    if (!isCurrentConversation) {
+      unawaited(
+        NotificationService().showMessageNotification(
+          fromName: msg.fromUid,
+          message: msg.body,
+          conversationId: msg.groupId ?? msg.fromUid,
+          conversationType: msg.groupId != null ? 'group' : 'direct',
+        ),
+      );
+    }
+  }
+
+  void _startRealtimePolling() {
+    _realtimePollTimer?.cancel();
+    _realtimePollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted || _unreadPollInFlight) return;
+      unawaited(_loadUnreadCounts());
+    });
+  }
+
+  void _startSystemNotificationPolling() {
+    _systemNotificationTimer?.cancel();
+    unawaited(_pollSystemNotifications());
+    _systemNotificationTimer = Timer.periodic(const Duration(seconds: 12), (_) {
+      if (mounted) unawaited(_pollSystemNotifications());
+    });
+  }
+
+  Future<void> _pollSystemNotifications() async {
+    if (_systemNotificationPollInFlight || !mounted) return;
+    _systemNotificationPollInFlight = true;
+    try {
+      final data = await ApiService().getNotifications(limit: 50, offset: 0);
+      final raw =
+          data['items'] ?? data['notifications'] ?? data['data'] ?? data;
+      final items = raw is List ? raw.whereType<Map>().toList() : const <Map>[];
+      final incoming = <Map<String, dynamic>>[];
+      for (final item in items) {
+        final value = Map<String, dynamic>.from(item);
+        final id = (value['id'] ?? value['notification_id']).toString();
+        if (id.isEmpty) continue;
+        if (!_systemNotificationBaselineReady) {
+          _seenSystemNotificationIds.add(id);
+        } else if (!_seenSystemNotificationIds.contains(id) &&
+            value['is_read'] != true &&
+            value['read'] != true) {
+          incoming.add(value);
+        }
+        _seenSystemNotificationIds.add(id);
+      }
+      _systemNotificationBaselineReady = true;
+      for (final item in incoming.reversed) {
+        final title = (item['title'] ?? 'OldChat 通知').toString();
+        final body =
+            (item['body'] ?? item['content'] ?? item['message'] ?? '收到一条新通知')
+                .toString();
+        unawaited(
+          NotificationService().showNotification(title: title, body: body),
+        );
+      }
+      if (_seenSystemNotificationIds.length > 1000) {
+        _seenSystemNotificationIds.remove(_seenSystemNotificationIds.first);
+      }
+    } catch (error) {
+      debugPrint('[系统通知] 轮询失败：$error');
+    } finally {
+      _systemNotificationPollInFlight = false;
+    }
   }
 
   Future<void> _loadConversations() async {
@@ -263,9 +345,7 @@ class _HomePageState extends State<HomePage> {
       if (cached is List && mounted) {
         final conversations = cached
             .whereType<Map>()
-            .map((e) => Conversation.fromJson(
-                  Map<String, dynamic>.from(e),
-                ))
+            .map((e) => Conversation.fromJson(Map<String, dynamic>.from(e)))
             .toList();
         setState(() {
           _friends = conversations.where((c) => c.type == 'direct').toList();
@@ -282,6 +362,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _loadUnreadCounts({String? excludeKey}) async {
+    if (_unreadPollInFlight) return;
+    _unreadPollInFlight = true;
     try {
       final api = ApiService();
       final directUnread = await api.getDirectUnread();
@@ -321,8 +403,11 @@ class _HomePageState extends State<HomePage> {
         final serverCount = counts[entry.key] ?? 0;
         if (entry.value > serverCount) counts[entry.key] = entry.value;
       }
-      final activeKey = excludeKey ??
-          (_currentConversation == null ? null : _conversationKey(_currentConversation!));
+      final activeKey =
+          excludeKey ??
+          (_currentConversation == null
+              ? null
+              : _conversationKey(_currentConversation!));
       if (activeKey != null) counts.remove(activeKey);
       if (mounted) {
         setState(() {
@@ -338,6 +423,8 @@ class _HomePageState extends State<HomePage> {
           _totalUnread = 0;
         });
       }
+    } finally {
+      _unreadPollInFlight = false;
     }
   }
 
@@ -403,7 +490,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _showConversationMenu(
-      BuildContext context, Conversation conv, TapDownDetails details) {
+    BuildContext context,
+    Conversation conv,
+    TapDownDetails details,
+  ) {
     final key = _conversationKey(conv);
     final isPinned = _pinnedMap[key] ?? conv.pinned;
     showMenu<String>(
@@ -419,8 +509,10 @@ class _HomePageState extends State<HomePage> {
           value: isPinned ? 'unpin' : 'pin',
           child: Row(
             children: [
-              Icon(isPinned ? Icons.push_pin_outlined : Icons.push_pin,
-                  size: 18),
+              Icon(
+                isPinned ? Icons.push_pin_outlined : Icons.push_pin,
+                size: 18,
+              ),
               const SizedBox(width: 8),
               Text(isPinned ? '取消置顶' : '置顶'),
             ],
@@ -474,80 +566,89 @@ class _HomePageState extends State<HomePage> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error != null
-              ? Center(
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('加载失败: $_error'),
+                  TextButton(onPressed: _refresh, child: const Text('重试')),
+                ],
+              ),
+            )
+          : Row(
+              children: [
+                SizedBox(
+                  width: 280,
                   child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Text('加载失败: $_error'),
-                      TextButton(onPressed: _refresh, child: const Text('重试')),
+                      _buildToolbar(),
+                      Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: TextField(
+                          controller: _searchController,
+                          decoration: InputDecoration(
+                            hintText: '搜索好友或群聊...',
+                            prefixIcon: const Icon(Icons.search),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(24),
+                              borderSide: BorderSide.none,
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey[200],
+                          ),
+                          onChanged: (q) {
+                            _searchTimer?.cancel();
+                            _searchTimer = Timer(
+                              const Duration(milliseconds: 300),
+                              () {
+                                setState(() {});
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                      Expanded(child: _buildList()),
                     ],
                   ),
-                )
-              : Row(
-                  children: [
-                    SizedBox(
-                      width: 280,
-                      child: Column(
-                        children: [
-                          _buildToolbar(),
-                          Padding(
-                            padding: const EdgeInsets.all(8),
-                            child: TextField(
-                              controller: _searchController,
-                              decoration: InputDecoration(
-                                hintText: '搜索好友或群聊...',
-                                prefixIcon: const Icon(Icons.search),
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(24),
-                                  borderSide: BorderSide.none,
-                                ),
-                                filled: true,
-                                fillColor: Colors.grey[200],
-                              ),
-                              onChanged: (q) {
-                                _searchTimer?.cancel();
-                                _searchTimer = Timer(
-                                    const Duration(milliseconds: 300), () {
-                                  setState(() {});
-                                });
-                              },
-                            ),
-                          ),
-                          Expanded(child: _buildList()),
-                        ],
-                      ),
-                    ),
-                    Expanded(
-                      child: _currentConversation == null
-                          ? Center(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(Icons.chat_bubble_outline,
-                                      size: 64, color: Colors.grey[400]),
-                                  const SizedBox(height: 16),
-                                  Text('选择一个会话开始聊天',
-                                      style: TextStyle(
-                                          fontSize: 16,
-                                          color: Colors.grey[600])),
-                                ],
-                              ),
-                            )
-                          : ChatPage(
-                              key: ValueKey(
-                                  '${_currentConversation!.type}:${_currentConversation!.id}'),
-                              conversationId: _currentConversation!.id,
-                              type: _currentConversation!.type,
-                              title: _currentConversation!.name ?? '聊天',
-                              embed: true,
-                              onMessageSent: () {
-                                unawaited(_loadConversations());
-                                unawaited(_loadUnreadCounts());
-                              },
-                            ),
-                    ),
-                  ],
                 ),
+                Expanded(
+                  child: _currentConversation == null
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.chat_bubble_outline,
+                                size: 64,
+                                color: Colors.grey[400],
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                '选择一个会话开始聊天',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  color: Colors.grey[600],
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : ChatPage(
+                          key: ValueKey(
+                            '${_currentConversation!.type}:${_currentConversation!.id}',
+                          ),
+                          conversationId: _currentConversation!.id,
+                          type: _currentConversation!.type,
+                          title: _currentConversation!.name ?? '聊天',
+                          embed: true,
+                          onMessageSent: () {
+                            unawaited(_loadConversations());
+                            unawaited(_loadUnreadCounts());
+                          },
+                        ),
+                ),
+              ],
+            ),
     );
   }
 
@@ -556,85 +657,80 @@ class _HomePageState extends State<HomePage> {
     final avatarUrl = _avatarUrl != null ? resolveMediaUrl(_avatarUrl) : null;
     final displayTotal = displayUnread;
 
-    return Container(
-      height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      decoration: BoxDecoration(color: primaryColor),
-      child: Row(
-        children: [
-          GestureDetector(
-            onTap: () => Navigator.pushNamed(context, '/profile'),
-            child: CircleAvatar(
-              radius: 16,
-              backgroundColor: Colors.white,
-              backgroundImage:
-                  avatarUrl != null ? NetworkImage(avatarUrl) : null,
-              child: avatarUrl == null
-                  ? const Icon(Icons.person, size: 20, color: Colors.pink)
-                  : null,
-            ),
-          ),
-          const SizedBox(width: 8),
-          if (displayTotal > 0)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                  color: Colors.red, borderRadius: BorderRadius.circular(10)),
-              child: Text(
-                displayTotal > 99 ? '99+' : '$displayTotal',
-                style: const TextStyle(color: Colors.white, fontSize: 11),
+    return RepaintBoundary(
+      child: Container(
+        height: 48,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(color: primaryColor),
+        child: Row(
+          children: [
+            GestureDetector(
+              onTap: () => Navigator.pushNamed(context, '/profile'),
+              child: CircleAvatar(
+                radius: 16,
+                backgroundColor: Colors.white,
+                backgroundImage:
+                    avatarUrl != null ? NetworkImage(avatarUrl) : null,
+                child: avatarUrl == null
+                    ? const Icon(Icons.person, size: 20, color: Colors.pink)
+                    : null,
               ),
             ),
-          const Spacer(),
-          IconButton(
-            icon: _refreshing
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Icon(Icons.refresh, color: Colors.white, size: 20),
-            onPressed: _refresh,
-            tooltip: '刷新会话列表',
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-          ),
-          _buildMusicButton(),
-          _buildToolbarButton(Icons.photo_album, '/moments', '动态'),
-          _buildEmojiButton(),
-          // ★ 通知按钮显示好友申请红点
-          IconButton(
-            icon:
-                const Icon(Icons.notifications, color: Colors.white, size: 20),
-            onPressed: () => Navigator.pushNamed(context, '/notifications'),
-            tooltip: '通知',
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-          ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, color: Colors.white),
-            color: Colors.white,
-            onSelected: (value) {
-              if (value == 'logout')
-                _logout();
-              else
-                Navigator.pushNamed(context, value);
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: '/favorites', child: Text('我的收藏')),
-              const PopupMenuItem(value: '/checkin_wall', child: Text('签到墙')),
-              const PopupMenuItem(value: '/ai_chat', child: Text('AI助手')),
-              const PopupMenuItem(value: '/settings', child: Text('设置')),
-              const PopupMenuItem(value: '/about', child: Text('关于 OldChat')),
-              const PopupMenuItem(
-                  value: 'logout',
-                  child: Text('退出登录', style: TextStyle(color: Colors.red))),
-            ],
-          ),
-        ],
+            const SizedBox(width: 8),
+            if (displayTotal > 0)
+              Container(
+                constraints: const BoxConstraints(minWidth: 20),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  displayTotal > 99 ? '99+' : '$displayTotal',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                ),
+              ),
+            const Spacer(),
+            IconButton(
+              icon: _refreshing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.refresh, color: Colors.white, size: 20),
+              onPressed: _refresh,
+              tooltip: '刷新会话列表',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+            ),
+            IconButton(
+              icon: const Icon(Icons.logout, color: Colors.redAccent, size: 20),
+              onPressed: _logout,
+              tooltip: '退出登录',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+            ),
+            IconButton(
+              icon: const Icon(Icons.apps, color: Colors.white, size: 20),
+              onPressed: () => Navigator.pushNamed(context, '/tools'),
+              tooltip: '功能',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+            ),
+            IconButton(
+              icon: const Icon(Icons.more_vert, color: Colors.white, size: 20),
+              onPressed: () => Navigator.pushNamed(context, '/more'),
+              tooltip: '更多',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -642,53 +738,7 @@ class _HomePageState extends State<HomePage> {
   Widget _buildMusicButton() {
     return IconButton(
       icon: const Icon(Icons.music_note, color: Colors.white, size: 20),
-      onPressed: () async {
-        final result = await Navigator.pushNamed(context, '/music_plaza');
-        if (result != null &&
-            result is Map<String, dynamic> &&
-            _currentConversation != null) {
-          final conv = _currentConversation!;
-          final api = ApiService();
-          final String audioUrl = result['song_url'] ?? result['url'] ?? '';
-          final String coverUrl = result['cover'] ?? '';
-          final String title = result['text'] ?? '未知歌曲';
-          final String artist = result['artist'] ?? '未知歌手';
-          final String duration = result['duration'] ?? '00:00';
-
-          final bodyJson = jsonEncode({
-            'v': 2,
-            'text': '歌曲: $title\n歌手: $artist\n时长: $duration\n点击播放',
-            'media_kind': 'music',
-          });
-
-          try {
-            if (conv.type == 'direct') {
-              await api.sendDirectMessage(
-                toUid: conv.id,
-                body: bodyJson,
-                msgType: 'resource',
-                mediaUrl: audioUrl,
-                thumbUrl: coverUrl,
-              );
-            } else {
-              await api.sendGroupMessage(
-                groupId: conv.id,
-                body: bodyJson,
-                msgType: 'resource',
-                mediaUrl: audioUrl,
-                thumbUrl: coverUrl,
-              );
-            }
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('音乐已分享')),
-            );
-          } catch (e) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('分享失败: $e')),
-            );
-          }
-        }
-      },
+      onPressed: () => Navigator.pushNamed(context, '/music_plaza'),
       tooltip: '音乐广场',
       padding: const EdgeInsets.all(4),
       constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
@@ -698,30 +748,7 @@ class _HomePageState extends State<HomePage> {
   Widget _buildEmojiButton() {
     return IconButton(
       icon: const Icon(Icons.emoji_emotions, color: Colors.white, size: 20),
-      onPressed: () async {
-        final url =
-            await Navigator.pushNamed(context, '/emoji_plaza') as String?;
-        if (url != null && url.isNotEmpty && _currentConversation != null) {
-          final conv = _currentConversation!;
-          final api = ApiService();
-          try {
-            if (conv.type == 'direct') {
-              await api.sendDirectMessage(
-                  toUid: conv.id, body: '', msgType: 'image', mediaUrl: url);
-            } else {
-              await api.sendGroupMessage(
-                  groupId: conv.id, body: '', msgType: 'image', mediaUrl: url);
-            }
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('表情已发送')),
-            );
-          } catch (e) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('发送失败: $e')),
-            );
-          }
-        }
-      },
+      onPressed: () => Navigator.pushNamed(context, '/emoji_plaza'),
       tooltip: '表情',
       padding: const EdgeInsets.all(4),
       constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
@@ -742,16 +769,20 @@ class _HomePageState extends State<HomePage> {
     final query = _searchController.text.trim().toLowerCase();
     final filteredFriends = _sortConversations(
       _friends
-          .where((c) =>
-              c.name?.toLowerCase().contains(query) == true ||
-              c.id.toLowerCase().contains(query))
+          .where(
+            (c) =>
+                c.name?.toLowerCase().contains(query) == true ||
+                c.id.toLowerCase().contains(query),
+          )
           .toList(),
     );
     final filteredGroups = _sortConversations(
       _groups
-          .where((c) =>
-              c.name?.toLowerCase().contains(query) == true ||
-              c.id.toLowerCase().contains(query))
+          .where(
+            (c) =>
+                c.name?.toLowerCase().contains(query) == true ||
+                c.id.toLowerCase().contains(query),
+          )
           .toList(),
     );
 
@@ -764,42 +795,54 @@ class _HomePageState extends State<HomePage> {
         if (filteredGroups.isNotEmpty) ...[
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Text('群聊',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 13,
-                    color: Colors.grey)),
+            child: Text(
+              '群聊',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 13,
+                color: Colors.grey,
+              ),
+            ),
           ),
-          ...filteredGroups.map((conv) => ConversationTile(
-                conversation: conv,
-                unreadCount: _unreadCounts['group:${conv.id}'] ?? 0,
-                onTap: () => _selectConversation(conv),
-                onSecondaryTapDown: (details) =>
-                    _showConversationMenu(context, conv, details),
-                isActive: _currentConversation?.id == conv.id &&
-                    _currentConversation?.type == 'group',
-                isPinned: _isPinned(conv),
-              )),
+          ...filteredGroups.map(
+            (conv) => ConversationTile(
+              conversation: conv,
+              unreadCount: _unreadCounts['group:${conv.id}'] ?? 0,
+              onTap: () => _selectConversation(conv),
+              onSecondaryTapDown: (details) =>
+                  _showConversationMenu(context, conv, details),
+              isActive:
+                  _currentConversation?.id == conv.id &&
+                  _currentConversation?.type == 'group',
+              isPinned: _isPinned(conv),
+            ),
+          ),
         ],
         if (filteredFriends.isNotEmpty) ...[
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Text('私聊',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 13,
-                    color: Colors.grey)),
+            child: Text(
+              '私聊',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 13,
+                color: Colors.grey,
+              ),
+            ),
           ),
-          ...filteredFriends.map((conv) => ConversationTile(
-                conversation: conv,
-                unreadCount: _unreadCounts['direct:${conv.id}'] ?? 0,
-                onTap: () => _selectConversation(conv),
-                onSecondaryTapDown: (details) =>
-                    _showConversationMenu(context, conv, details),
-                isActive: _currentConversation?.id == conv.id &&
-                    _currentConversation?.type == 'direct',
-                isPinned: _isPinned(conv),
-              )),
+          ...filteredFriends.map(
+            (conv) => ConversationTile(
+              conversation: conv,
+              unreadCount: _unreadCounts['direct:${conv.id}'] ?? 0,
+              onTap: () => _selectConversation(conv),
+              onSecondaryTapDown: (details) =>
+                  _showConversationMenu(context, conv, details),
+              isActive:
+                  _currentConversation?.id == conv.id &&
+                  _currentConversation?.type == 'direct',
+              isPinned: _isPinned(conv),
+            ),
+          ),
         ],
       ],
     );

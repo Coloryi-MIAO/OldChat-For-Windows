@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/api_service.dart';
+import '../widgets/cached_image.dart';
 import '../services/auth_service.dart';
 import '../utils/url_helper.dart';
 import '../pages/moments_page.dart';
@@ -51,7 +52,7 @@ class _UserProfilePageState extends State<UserProfilePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('好友申请已发送')),
       );
-      setState(() => _isFriend = true);
+      if (mounted) setState(() => _isFriend = true);
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('发送失败: $e')),
@@ -109,20 +110,23 @@ class _UserProfilePageState extends State<UserProfilePage> {
                             children: [
                               CircleAvatar(
                                 radius: 50,
-                                backgroundImage:
-                                    _profile!['avatar_url'] != null &&
-                                            _profile!['avatar_url']
-                                                .toString()
-                                                .isNotEmpty
-                                        ? NetworkImage(resolveMediaUrl(
-                                            _profile!['avatar_url']))
-                                        : null,
+                                backgroundImage: null,
                                 child: _profile!['avatar_url'] == null ||
                                         _profile!['avatar_url']
                                             .toString()
                                             .isEmpty
                                     ? const Icon(Icons.person, size: 46)
-                                    : null,
+                                    : ClipOval(
+                                        child: CachedImage(
+                                          resolveMediaUrl(_profile!['avatar_url']),
+                                          width: 100,
+                                          height: 100,
+                                          cacheWidth: 240,
+                                          fit: BoxFit.cover,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Icon(Icons.person, size: 46),
+                                        ),
+                                      ),
                               ),
                               const SizedBox(height: 16),
                               Text(
@@ -138,6 +142,11 @@ class _UserProfilePageState extends State<UserProfilePage> {
                                 _profile!['uid'] ?? '',
                                 style: const TextStyle(color: Colors.grey),
                               ),
+                              if ((_profile!['user_title'] ?? _profile!['title'] ?? '').toString().trim().isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Chip(label: Text((_profile!['user_title'] ?? _profile!['title']).toString())),
+                                ),
                               const SizedBox(height: 8),
                               Text(
                                 _profile!['signature'] ?? '暂无签名',

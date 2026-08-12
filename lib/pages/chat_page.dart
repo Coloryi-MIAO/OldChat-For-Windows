@@ -1,12 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ffi';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
+import 'package:ffi/ffi.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:win32/win32.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../services/cache_service.dart';
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
@@ -70,8 +76,12 @@ class _ChatPageState extends State<ChatPage>
   String? _lastMessageId;
   int _lastGroupSeq = 0;
   final Map<String, Message> _messageMap = {};
+  final List<Map<String, String>> _pendingMentions = [];
   bool _realtimeSyncInFlight = false;
   bool _initialLoadFinished = false;
+  bool _markReadInFlight = false;
+  bool _markReadPending = false;
+  bool _clipboardPasteInFlight = false;
 
   @override
   void initState() {
@@ -81,6 +91,7 @@ class _ChatPageState extends State<ChatPage>
     final ws = WebSocketService();
     ws.addDirectListener(_onNewMessage);
     ws.addGroupListener(_onNewMessage);
+    ws.addRecallListener(_onMessageRecalled);
     ws.connect();
     _scrollController.addListener(_onScroll);
     unawaited(_loadMessages(initial: true));
@@ -123,9 +134,11 @@ class _ChatPageState extends State<ChatPage>
 
   void _refreshUnreadButtonState() {
     if (!_scrollController.hasClients) return;
-    final isAtBottom = _scrollController.position.pixels >=
+    final isAtBottom =
+        _scrollController.position.pixels >=
         _scrollController.position.maxScrollExtent - 50;
-    final shouldShowUnread = !isAtBottom &&
+    final shouldShowUnread =
+        !isAtBottom &&
         _firstUnreadIndex != null &&
         _firstUnreadIndex! >= 0 &&
         _firstUnreadIndex! < _messages.length;
@@ -156,6 +169,7 @@ class _ChatPageState extends State<ChatPage>
     }
     WebSocketService().removeDirectListener(_onNewMessage);
     WebSocketService().removeGroupListener(_onNewMessage);
+    WebSocketService().removeRecallListener(_onMessageRecalled);
     _inputController.dispose();
     _inputFocus.dispose();
     _scrollController.dispose();
@@ -195,8 +209,9 @@ class _ChatPageState extends State<ChatPage>
   void _updatePollCursor(Message msg, {bool fromWebSocket = false}) {
     if (widget.type == 'group') {
       if (msg.groupSeq != null) {
-        _lastGroupSeq =
-            _lastGroupSeq < msg.groupSeq! ? msg.groupSeq! : _lastGroupSeq;
+        _lastGroupSeq = _lastGroupSeq < msg.groupSeq!
+            ? msg.groupSeq!
+            : _lastGroupSeq;
       }
       return;
     }
@@ -216,10 +231,17 @@ class _ChatPageState extends State<ChatPage>
   }
 
   void _addLocalMessage(Message message) {
-    if (_messageMap.containsKey(message.id)) return;
+    if (message.id.isEmpty || _messageMap.containsKey(message.id)) return;
     _messageMap[message.id] = message;
     _updatePollCursor(message);
-    _messages.add(message);
+    final insertAt = _messages.indexWhere(
+      (existing) => _compareMessages(existing, message) > 0,
+    );
+    if (insertAt < 0) {
+      _messages.add(message);
+    } else {
+      _messages.insert(insertAt, message);
+    }
     _messageKeys[message.id] = GlobalKey();
   }
 
@@ -228,20 +250,25 @@ class _ChatPageState extends State<ChatPage>
     if (widget.type == 'direct' &&
         msg.fromUid != widget.conversationId &&
         msg.threadId != widget.conversationId &&
-        msg.threadId != null) return;
+        msg.toUid != widget.conversationId)
+      return;
     if (widget.type == 'group' && msg.groupId != widget.conversationId) return;
     if (_messageMap.containsKey(msg.id)) return;
     if (widget.type == 'direct' &&
         msg.fromUid == context.read<AuthService>().userId &&
-        msg.threadId != widget.conversationId) return;
-    final wasAtBottom = !_scrollController.hasClients ||
+        msg.threadId != widget.conversationId)
+      return;
+    final wasAtBottom =
+        !_scrollController.hasClients ||
         _scrollController.position.maxScrollExtent -
                 _scrollController.position.pixels <=
             80;
     _isUserAtBottom = wasAtBottom;
     _messageMap[msg.id] = msg;
     _updatePollCursor(msg, fromWebSocket: true);
-    final insertAt = _messages.indexWhere((existing) => _compareMessages(existing, msg) > 0);
+    final insertAt = _messages.indexWhere(
+      (existing) => _compareMessages(existing, msg) > 0,
+    );
     setState(() {
       if (insertAt < 0) {
         _messages.add(msg);
@@ -251,6 +278,7 @@ class _ChatPageState extends State<ChatPage>
       _messageKeys[msg.id] = GlobalKey();
     });
     unawaited(_saveCachedMessages());
+    unawaited(_markConversationRead());
     if (wasAtBottom) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && _isVisible) unawaited(_scheduleScrollToBottom());
@@ -258,10 +286,57 @@ class _ChatPageState extends State<ChatPage>
     }
   }
 
+  Future<void> _onMessageRecalled(String messageId, String displayName) async {
+    if (!mounted || !_isVisible) return;
+    final old = _messageMap[messageId];
+    if (old == null) return;
+    if (widget.type == 'group' && old.groupId != widget.conversationId) return;
+    if (widget.type == 'direct' &&
+        old.fromUid != widget.conversationId &&
+        old.toUid != widget.conversationId &&
+        old.threadId != widget.conversationId) {
+      return;
+    }
+
+    var name = displayName.trim();
+    if (name.isEmpty || name == old.fromUid) {
+      try {
+        final profile = await ApiService().getUserProfile(old.fromUid);
+        name = (profile['display_name'] ??
+                profile['nickname'] ??
+                profile['username'] ??
+                old.fromUid)
+            .toString()
+            .trim();
+      } catch (_) {}
+    }
+    if (name.isEmpty) name = old.fromUid == context.read<AuthService>().userId ? '我' : '对方';
+    if (!mounted) return;
+
+    final recalled = Message(
+      id: old.id,
+      fromUid: old.fromUid,
+      fromNcuid: old.fromNcuid,
+      body: jsonEncode({'v': 2, 'text': '$name撤回消息', 'recall': true}),
+      msgType: 'text',
+      createdAt: old.createdAt,
+      groupId: old.groupId,
+      groupSeq: old.groupSeq,
+      threadId: old.threadId,
+      toUid: old.toUid,
+    );
+    setState(() {
+      final index = _messages.indexWhere((message) => message.id == messageId);
+      if (index >= 0) _messages[index] = recalled;
+      _messageMap[messageId] = recalled;
+    });
+    unawaited(_saveCachedMessages());
+  }
+
   void _startPolling() {
     _pollTimer?.cancel();
     if (!_isVisible) return;
-    _pollTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (!mounted || !_isVisible || _isLoadingMore || _loading) return;
       unawaited(_syncIncrementalMessages());
     });
@@ -274,32 +349,49 @@ class _ChatPageState extends State<ChatPage>
     try {
       final api = ApiService();
       final result = widget.type == 'group'
-          ? await api.getGroupMessagesAfter(widget.conversationId, _lastGroupSeq)
-          : (_lastMessageCreatedAt == null
-              ? <String, dynamic>{'messages': const <Message>[]}
-              : await api.getDirectMessages(
-                  withUid: widget.conversationId,
-                  limit: 100,
-                  afterCreatedAt: _lastMessageCreatedAt,
-                  afterId: _lastMessageId,
-                ));
+          ? await api.getGroupMessagesAfter(
+              widget.conversationId,
+              _lastGroupSeq,
+            )
+          : await api.getDirectMessages(
+              withUid: widget.conversationId,
+              limit: 100,
+              afterCreatedAt: _lastMessageCreatedAt,
+              afterId: _lastMessageId,
+            );
       if (!mounted || !_isVisible) return;
-      final newMessages = (result['messages'] as List<Message>?) ?? const <Message>[];
+      final newMessages =
+          (result['messages'] as List?)?.whereType<Message>().toList() ??
+          const <Message>[];
       final relevantMessages = newMessages.where((message) {
-        if (widget.type == 'group') return message.groupId == widget.conversationId;
+        if (widget.type == 'group')
+          return message.groupId == widget.conversationId;
         return message.fromUid == widget.conversationId ||
             message.threadId == widget.conversationId ||
             message.fromUid == context.read<AuthService>().userId;
       }).toList();
       if (widget.type == 'group') {
-        final nextSeq = int.tryParse('${result['next_group_seq'] ?? _lastGroupSeq}') ?? _lastGroupSeq;
-        if (nextSeq > _lastGroupSeq) _lastGroupSeq = nextSeq;
+        final serverSeq =
+            int.tryParse('${result['server_group_seq'] ?? _lastGroupSeq}') ??
+            _lastGroupSeq;
+        if (serverSeq < _lastGroupSeq) {
+          _lastGroupSeq = 0;
+        } else {
+          final nextSeq =
+              int.tryParse('${result['next_group_seq'] ?? _lastGroupSeq}') ??
+              _lastGroupSeq;
+          if (nextSeq > _lastGroupSeq) _lastGroupSeq = nextSeq;
+        }
       }
       final wasAtBottom = _isUserAtBottom;
       _insertRealtimeMessages(relevantMessages);
+      if (relevantMessages.isNotEmpty) {
+        unawaited(_markConversationRead());
+      }
       if (relevantMessages.isNotEmpty && wasAtBottom) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && _isVisible) unawaited(_scheduleScrollToBottom(animate: false));
+          if (mounted && _isVisible)
+            unawaited(_scheduleScrollToBottom(animate: false));
         });
       }
     } catch (error) {
@@ -319,13 +411,24 @@ class _ChatPageState extends State<ChatPage>
     }
     if (newOnes.isEmpty) return;
     setState(() {
-      _messages.addAll(newOnes);
-      _messages.sort(_compareMessages);
       for (final message in newOnes) {
+        final insertAt = _messages.indexWhere(
+          (existing) => _compareMessages(existing, message) > 0,
+        );
+        if (insertAt < 0) {
+          _messages.add(message);
+        } else {
+          _messages.insert(insertAt, message);
+        }
         _messageKeys[message.id] = GlobalKey();
       }
+      _firstUnreadIndex ??= _messages.indexWhere(
+        (message) => message.fromUid != context.read<AuthService>().userId &&
+            (message.readAt == null || message.readAt == 0),
+      );
     });
     unawaited(_saveCachedMessages());
+    unawaited(_markConversationRead());
   }
 
   Future<void> _loadMessages({bool initial = false}) async {
@@ -340,29 +443,31 @@ class _ChatPageState extends State<ChatPage>
               withUid: widget.conversationId,
               limit: initial ? 15 : 30,
               offset: _offset,
-              beforeCreatedAt: !initial &&
+              beforeCreatedAt:
+                  !initial &&
                       _nextBeforeCreatedAt != null &&
                       _nextBeforeCreatedAt!.isNotEmpty
                   ? _nextBeforeCreatedAt
                   : null,
               beforeId:
                   !initial && _nextBeforeId != null && _nextBeforeId!.isNotEmpty
-                      ? _nextBeforeId
-                      : null,
+                  ? _nextBeforeId
+                  : null,
             )
           : await api.getGroupMessages(
               groupId: widget.conversationId,
               limit: initial ? 15 : 30,
               offset: _offset,
-              beforeCreatedAt: !initial &&
+              beforeCreatedAt:
+                  !initial &&
                       _nextBeforeCreatedAt != null &&
                       _nextBeforeCreatedAt!.isNotEmpty
                   ? _nextBeforeCreatedAt
                   : null,
               beforeId:
                   !initial && _nextBeforeId != null && _nextBeforeId!.isNotEmpty
-                      ? _nextBeforeId
-                      : null,
+                  ? _nextBeforeId
+                  : null,
             );
       final newMessages = (result['messages'] as List<Message>?) ?? [];
 
@@ -399,9 +504,11 @@ class _ChatPageState extends State<ChatPage>
           _initialLoadFinished = true;
         });
         await _saveCachedMessages();
-        if (_messages.any((m) =>
-            m.fromUid != context.read<AuthService>().userId &&
-            (m.readAt == null || m.readAt == 0))) {
+        if (_messages.any(
+          (m) =>
+              m.fromUid != context.read<AuthService>().userId &&
+              (m.readAt == null || m.readAt == 0),
+        )) {
           unawaited(_markConversationRead());
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -409,13 +516,14 @@ class _ChatPageState extends State<ChatPage>
         });
       } else {
         final oldFirstId = _messages.isEmpty ? null : _messages.first.id;
-        final oldFirstKey =
-            oldFirstId == null ? null : _messageKeys[oldFirstId];
+        final oldFirstKey = oldFirstId == null
+            ? null
+            : _messageKeys[oldFirstId];
         final oldFirstDy = oldFirstKey?.currentContext == null
             ? null
             : (oldFirstKey!.currentContext!.findRenderObject() as RenderBox)
-                .localToGlobal(Offset.zero)
-                .dy;
+                  .localToGlobal(Offset.zero)
+                  .dy;
 
         final olderMessages = newMessages.toList()..sort(_compareMessages);
         final toAdd = olderMessages
@@ -447,17 +555,20 @@ class _ChatPageState extends State<ChatPage>
 
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (_scrollController.hasClients) {
-            final newFirstKey =
-                oldFirstId == null ? null : _messageKeys[oldFirstId];
+            final newFirstKey = oldFirstId == null
+                ? null
+                : _messageKeys[oldFirstId];
             final newFirstDy = newFirstKey?.currentContext == null
                 ? null
                 : (newFirstKey!.currentContext!.findRenderObject() as RenderBox)
-                    .localToGlobal(Offset.zero)
-                    .dy;
+                      .localToGlobal(Offset.zero)
+                      .dy;
             if (oldFirstDy != null && newFirstDy != null) {
               final target =
-                  (_scrollController.offset + oldFirstDy - newFirstDy)
-                      .clamp(0.0, _scrollController.position.maxScrollExtent);
+                  (_scrollController.offset + oldFirstDy - newFirstDy).clamp(
+                    0.0,
+                    _scrollController.position.maxScrollExtent,
+                  );
               _scrollController.jumpTo(target);
             }
           }
@@ -466,13 +577,16 @@ class _ChatPageState extends State<ChatPage>
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('加载消息失败: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('加载消息失败: $e')));
     }
   }
 
-  Future<void> _scheduleScrollToBottom(
-      {bool animate = true, int retries = 0}) async {
+  Future<void> _scheduleScrollToBottom({
+    bool animate = true,
+    int retries = 0,
+  }) async {
     if (!mounted) return;
     await WidgetsBinding.instance.endOfFrame;
     if (!mounted || !_scrollController.hasClients) return;
@@ -487,7 +601,8 @@ class _ChatPageState extends State<ChatPage>
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOut,
       );
-    } else if (!animate && (target - _scrollController.position.pixels).abs() > 1) {
+    } else if (!animate &&
+        (target - _scrollController.position.pixels).abs() > 1) {
       _scrollController.jumpTo(target);
     }
     if (mounted) {
@@ -497,19 +612,20 @@ class _ChatPageState extends State<ChatPage>
   }
 
   String get _cacheKey => CacheService().scoped(
-        context.read<AuthService>().userId ?? 'guest',
-        'messages:${widget.type}:${widget.conversationId}',
-      );
+    context.read<AuthService>().userId ?? 'guest',
+    'messages:${widget.type}:${widget.conversationId}',
+  );
 
   Future<void> _restoreCachedMessages() async {
     _cacheHydrated = true;
     final cached = await CacheService().readJson(_cacheKey);
     if (cached is! List || cached.isEmpty || !mounted) return;
-    final restored = cached
-        .whereType<Map>()
-        .map((item) => Message.fromJson(Map<String, dynamic>.from(item)))
-        .toList()
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final restored =
+        cached
+            .whereType<Map>()
+            .map((item) => Message.fromJson(Map<String, dynamic>.from(item)))
+            .toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
     final visible = restored.length > 15
         ? restored.sublist(restored.length - 15)
         : restored;
@@ -535,11 +651,26 @@ class _ChatPageState extends State<ChatPage>
   }
 
   Future<void> _markConversationRead() async {
-    final api = ApiService();
-    if (widget.type == 'direct') {
-      await api.markDirectRead(widget.conversationId);
-    } else {
-      await api.markGroupRead(widget.conversationId);
+    if (_markReadInFlight) {
+      _markReadPending = true;
+      return;
+    }
+    _markReadInFlight = true;
+    try {
+      final api = ApiService();
+      if (widget.type == 'direct') {
+        await api.markDirectRead(widget.conversationId);
+      } else {
+        await api.markGroupRead(widget.conversationId);
+      }
+    } catch (error) {
+      debugPrint('[已读同步失败] $error');
+    } finally {
+      _markReadInFlight = false;
+      if (_markReadPending && mounted && _isVisible) {
+        _markReadPending = false;
+        unawaited(_markConversationRead());
+      }
     }
   }
 
@@ -559,8 +690,11 @@ class _ChatPageState extends State<ChatPage>
     _scheduleScrollToBottom();
   }
 
-  Future<void> _scrollToMessage(String messageId,
-      {int retry = 0, bool searchOlder = true}) async {
+  Future<void> _scrollToMessage(
+    String messageId, {
+    int retry = 0,
+    bool searchOlder = true,
+  }) async {
     final index = _messages.indexWhere((m) => m.id == messageId);
     if (index != -1) {
       final key = _messageKeys[messageId];
@@ -592,7 +726,8 @@ class _ChatPageState extends State<ChatPage>
         }
         if (retry < 4) {
           WidgetsBinding.instance.addPostFrameCallback(
-              (_) => _scrollToMessage(messageId, retry: retry + 1));
+            (_) => _scrollToMessage(messageId, retry: retry + 1),
+          );
         }
       }
       return;
@@ -618,95 +753,24 @@ class _ChatPageState extends State<ChatPage>
     await showDialog<void>(
       context: context,
       builder: (context) {
-        return StatefulBuilder(builder: (context, setState) {
-          return AlertDialog(
-            title: const Text('搜索聊天记录'),
-            content: SizedBox(
-              width: 440,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                    controller: searchController,
-                    autofocus: true,
-                    decoration: const InputDecoration(
-                      hintText: '关键词',
-                      border: OutlineInputBorder(),
-                    ),
-                    onSubmitted: (_) async {
-                      if (loading) return;
-                      final query = searchController.text.trim();
-                      if (query.isEmpty) return;
-                      setState(() {
-                        loading = true;
-                        errorMessage = null;
-                      });
-                      try {
-                        final api = ApiService();
-                        final response = widget.type == 'direct'
-                            ? await api.searchDirectMessages(
-                                widget.conversationId, query)
-                            : await api.searchGroupMessages(
-                                widget.conversationId, query);
-                        results = _parseSearchMessages(response);
-                      } catch (e) {
-                        errorMessage = '搜索失败: $e';
-                      } finally {
-                        if (mounted) setState(() => loading = false);
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  if (loading) const CircularProgressIndicator(),
-                  if (errorMessage != null)
-                    Text(errorMessage!,
-                        style: const TextStyle(color: Colors.red)),
-                  if (!loading && results.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 16),
-                      child: Text('输入关键词后搜索聊天记录'),
-                    ),
-                  if (results.isNotEmpty)
-                    SizedBox(
-                      height: 280,
-                      child: ListView.builder(
-                        itemCount: results.length,
-                        itemBuilder: (context, index) {
-                          final result = results[index];
-                          return ListTile(
-                            title: Text(
-                              _getMessageDisplayText(result),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            subtitle: Text(_formatDateTime(result.createdAt)),
-                            onTap: () {
-                              Navigator.of(context).pop();
-                              if (!_messages
-                                  .any((message) => message.id == result.id)) {
-                                setState(() {
-                                  _addLocalMessage(result);
-                                  _messages.sort(_compareMessages);
-                                });
-                              }
-                              _scrollToMessage(result.id);
-                            },
-                          );
-                        },
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: const Text('搜索聊天记录'),
+              content: SizedBox(
+                width: 440,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: searchController,
+                      autofocus: true,
+                      decoration: const InputDecoration(
+                        hintText: '关键词',
+                        border: OutlineInputBorder(),
                       ),
-                    ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('关闭'),
-              ),
-              TextButton(
-                onPressed: loading
-                    ? null
-                    : () async {
+                      onSubmitted: (_) async {
+                        if (loading) return;
                         final query = searchController.text.trim();
                         if (query.isEmpty) return;
                         setState(() {
@@ -717,31 +781,119 @@ class _ChatPageState extends State<ChatPage>
                           final api = ApiService();
                           final response = widget.type == 'direct'
                               ? await api.searchDirectMessages(
-                                  widget.conversationId, query)
+                                  widget.conversationId,
+                                  query,
+                                )
                               : await api.searchGroupMessages(
-                                  widget.conversationId, query);
-                          final raw = response['messages'] ??
-                              response['results'] ??
-                              response['items'] ??
-                              response['records'] ??
-                              response['data'];
-                          final list = raw is List ? raw : const <dynamic>[];
-                          results = list
-                              .whereType<Map>()
-                              .map((item) => Message.fromJson(
-                                  Map<String, dynamic>.from(item)))
-                              .toList();
+                                  widget.conversationId,
+                                  query,
+                                );
+                          results = _parseSearchMessages(response);
                         } catch (e) {
                           errorMessage = '搜索失败: $e';
                         } finally {
                           if (mounted) setState(() => loading = false);
                         }
                       },
-                child: const Text('搜索'),
+                    ),
+                    const SizedBox(height: 12),
+                    if (loading) const CircularProgressIndicator(),
+                    if (errorMessage != null)
+                      Text(
+                        errorMessage!,
+                        style: const TextStyle(color: Colors.red),
+                      ),
+                    if (!loading && results.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 16),
+                        child: Text('输入关键词后搜索聊天记录'),
+                      ),
+                    if (results.isNotEmpty)
+                      SizedBox(
+                        height: 280,
+                        child: ListView.builder(
+                          itemCount: results.length,
+                          itemBuilder: (context, index) {
+                            final result = results[index];
+                            return ListTile(
+                              title: Text(
+                                _getMessageDisplayText(result),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              subtitle: Text(_formatDateTime(result.createdAt)),
+                              onTap: () {
+                                Navigator.of(context).pop();
+                                if (!_messages.any(
+                                  (message) => message.id == result.id,
+                                )) {
+                                  setState(() {
+                                    _addLocalMessage(result);
+                                    _messages.sort(_compareMessages);
+                                  });
+                                }
+                                _scrollToMessage(result.id);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                  ],
+                ),
               ),
-            ],
-          );
-        });
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('关闭'),
+                ),
+                TextButton(
+                  onPressed: loading
+                      ? null
+                      : () async {
+                          final query = searchController.text.trim();
+                          if (query.isEmpty) return;
+                          setState(() {
+                            loading = true;
+                            errorMessage = null;
+                          });
+                          try {
+                            final api = ApiService();
+                            final response = widget.type == 'direct'
+                                ? await api.searchDirectMessages(
+                                    widget.conversationId,
+                                    query,
+                                  )
+                                : await api.searchGroupMessages(
+                                    widget.conversationId,
+                                    query,
+                                  );
+                            final raw =
+                                response['messages'] ??
+                                response['results'] ??
+                                response['items'] ??
+                                response['records'] ??
+                                response['data'];
+                            final list = raw is List ? raw : const <dynamic>[];
+                            results = list
+                                .whereType<Map>()
+                                .map(
+                                  (item) => Message.fromJson(
+                                    Map<String, dynamic>.from(item),
+                                  ),
+                                )
+                                .toList();
+                          } catch (e) {
+                            errorMessage = '搜索失败: $e';
+                          } finally {
+                            if (mounted) setState(() => loading = false);
+                          }
+                        },
+                  child: const Text('搜索'),
+                ),
+              ],
+            );
+          },
+        );
       },
     );
   }
@@ -796,29 +948,37 @@ class _ChatPageState extends State<ChatPage>
                       itemCount: list.length,
                       itemBuilder: (context, index) {
                         final member = Map<String, dynamic>.from(list[index]);
-                        final uid = (member['uid'] ??
-                                member['user_uid'] ??
-                                member['id'] ??
-                                '')
-                            .toString();
-                        final name = (member['display_name'] ??
-                                member['nickname'] ??
-                                member['name'] ??
-                                uid)
-                            .toString();
-                        final rawAvatar = member['avatar_url'] ??
+                        final uid =
+                            (member['uid'] ??
+                                    member['user_uid'] ??
+                                    member['id'] ??
+                                    '')
+                                .toString();
+                        final name =
+                            (member['display_name'] ??
+                                    member['nickname'] ??
+                                    member['name'] ??
+                                    uid)
+                                .toString();
+                        final rawAvatar =
+                            member['avatar_url'] ??
                             member['avatar'] ??
                             member['photo_url'];
-                        final avatarUrl =
-                            resolveMediaUrl(rawAvatar?.toString());
+                        final avatarUrl = resolveMediaUrl(
+                          rawAvatar?.toString(),
+                        );
                         return ListTile(
                           leading: CircleAvatar(
                             backgroundImage: avatarUrl.isNotEmpty
-                                ? ImageCacheService.instance.provider(avatarUrl, cacheWidth: 96)
+                                ? ImageCacheService.instance.provider(
+                                    avatarUrl,
+                                    cacheWidth: 96,
+                                  )
                                 : null,
                             child: avatarUrl.isEmpty
                                 ? Text(
-                                    name.isEmpty ? '?' : name.substring(0, 1))
+                                    name.isEmpty ? '?' : name.substring(0, 1),
+                                  )
                                 : null,
                           ),
                           title: Text(name),
@@ -833,8 +993,8 @@ class _ChatPageState extends State<ChatPage>
                                   Navigator.of(context).pop();
                                   Navigator.of(this.context).push(
                                     MaterialPageRoute(
-                                        builder: (_) =>
-                                            UserProfilePage(uid: uid)),
+                                      builder: (_) => UserProfilePage(uid: uid),
+                                    ),
                                   );
                                 },
                         );
@@ -851,9 +1011,9 @@ class _ChatPageState extends State<ChatPage>
         },
       );
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('加载群成员失败: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('加载群成员失败: $e')));
     }
   }
 
@@ -861,8 +1021,8 @@ class _ChatPageState extends State<ChatPage>
     final milliseconds = timestamp > 1000000000000
         ? timestamp
         : timestamp > 1000000000
-            ? timestamp * 1000
-            : timestamp;
+        ? timestamp * 1000
+        : timestamp;
     final dt = DateTime.fromMillisecondsSinceEpoch(milliseconds);
     return DateFormat('yyyy/MM/dd HH:mm').format(dt);
   }
@@ -936,11 +1096,13 @@ class _ChatPageState extends State<ChatPage>
             content: const Text('您还不是对方的好友，需要先发送好友申请才能聊天。'),
             actions: [
               TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('取消')),
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
               TextButton(
-                  onPressed: () => Navigator.pop(context, true),
-                  child: const Text('发送申请')),
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('发送申请'),
+              ),
             ],
           ),
         ) ??
@@ -951,39 +1113,53 @@ class _ChatPageState extends State<ChatPage>
     try {
       final friends = await ApiService().getFriends();
       if (friends.any((f) => f.id == toUid)) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('你们已经是好友了')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('你们已经是好友了')));
         return;
       }
       final requests = await ApiService().getFriendRequests();
       final sent =
           (requests['sent'] as List?)?.any((r) => r['to_uid'] == toUid) ??
-              false;
+          false;
       final received =
           (requests['requests'] as List?)?.any((r) => r['from_uid'] == toUid) ??
-              false;
+          false;
       if (sent) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('您已发送过好友申请，请等待对方通过')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('您已发送过好友申请，请等待对方通过')));
         return;
       }
       if (received) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('对方已向您发送好友申请，请检查通知')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('对方已向您发送好友申请，请检查通知')));
         return;
       }
       await ApiService().sendFriendRequest(toUid);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('好友申请已发送，等待对方通过')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('好友申请已发送，等待对方通过')));
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('发送申请失败: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('发送申请失败: $e')));
     }
+  }
+
+  Future<void> _handleMessageAction(String action, String data) async {
+    if (data.trim().isEmpty) return;
+    if (action == 'send_text' || action == 'text' || action == 'send') {
+      await _sendTextMessage(data);
+      return;
+    }
+    if (action == 'open_url' || action == 'url') {
+      final uri = Uri.tryParse(data);
+      if (uri != null) await launchUrl(uri, mode: LaunchMode.externalApplication);
+      return;
+    }
+    await _sendTextMessage(data);
   }
 
   Future<void> _sendTextMessage(String text) async {
@@ -998,6 +1174,12 @@ class _ChatPageState extends State<ChatPage>
     }
 
     Map<String, dynamic> payload = {'v': 2, 'text': text};
+    if (_pendingMentions.isNotEmpty) {
+      payload['mentions'] = _pendingMentions
+          .map((mention) => {'uid': mention['uid'], 'name': mention['name']})
+          .toList();
+    }
+    _pendingMentions.clear();
     if (_quotedMessage != null) {
       payload['quote'] = {
         'id': _quotedMessage!.id,
@@ -1018,73 +1200,108 @@ class _ChatPageState extends State<ChatPage>
       final api = ApiService();
       final sent = widget.type == 'direct'
           ? await api.sendDirectMessage(
-              toUid: widget.conversationId, body: bodyJson)
-          : await api.sendGroupMessage(
-              groupId: widget.conversationId, body: bodyJson);
-      setState(() {
-        _addLocalMessage(sent);
-      });
-      await _saveCachedMessages();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _inputFocus.requestFocus();
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _scheduleScrollToBottom();
-      });
-      if (widget.onMessageSent != null) widget.onMessageSent!();
-    } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('发送失败: $e')));
-    }
-  }
-
-  Future<void> _sendMediaFile(File file, String type) async {
-    if (widget.type == 'direct' && !_isFriend) {
-      final shouldSend = await _showFriendRequestDialog();
-      if (shouldSend) {
-        await _sendFriendRequest(widget.conversationId);
-      }
-      return;
-    }
-    if (type == 'file') return;
-    try {
-      final api = ApiService();
-      final formData =
-          FormData.fromMap({'file': await MultipartFile.fromFile(file.path)});
-      final uploadResult = await api.uploadFile(formData);
-      final mediaUrl = uploadResult['url'];
-      if (mediaUrl == null) throw Exception('上传失败');
-      final msgType = type == 'image'
-          ? 'image'
-          : type == 'video'
-              ? 'video'
-              : 'file';
-      final sent = widget.type == 'direct'
-          ? await api.sendDirectMessage(
               toUid: widget.conversationId,
-              body: '',
-              msgType: msgType,
-              mediaUrl: mediaUrl,
+              body: bodyJson,
             )
           : await api.sendGroupMessage(
               groupId: widget.conversationId,
-              body: '',
-              msgType: msgType,
-              mediaUrl: mediaUrl,
+              body: bodyJson,
             );
       setState(() {
         _addLocalMessage(sent);
       });
       await _saveCachedMessages();
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _scheduleScrollToBottom();
         if (mounted) _inputFocus.requestFocus();
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scheduleScrollToBottom();
       });
       if (widget.onMessageSent != null) widget.onMessageSent!();
     } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('发送失败: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('发送失败: $e')));
     }
+  }
+
+  Future<void> _sendMediaFile(File file, String type) async {
+    if (widget.type == 'direct' && !_isFriend) {
+      final shouldSend = await _showFriendRequestDialog();
+      if (shouldSend) await _sendFriendRequest(widget.conversationId);
+      return;
+    }
+    try {
+      final api = ApiService();
+      final formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(
+          file.path,
+          filename: file.uri.pathSegments.last,
+        ),
+      });
+      final uploadResult = await api.uploadFile(formData);
+      final mediaUrl = ApiService.extractUploadUrl(uploadResult);
+      if (mediaUrl == null || mediaUrl.isEmpty) throw Exception('上传失败');
+      final isImage = type == 'image';
+      final isVideo = type == 'video';
+      final msgType = isImage
+          ? 'image'
+          : isVideo
+          ? 'video'
+          : 'resource';
+      final fileName = file.uri.pathSegments.last;
+      final body = jsonEncode({
+        'v': 2,
+        'text': '',
+        'media_kind': isImage
+            ? 'image'
+            : isVideo
+            ? 'video'
+            : 'file',
+        'file_name': fileName,
+        'url': mediaUrl,
+        'media_url': mediaUrl,
+        'size': await file.length(),
+      });
+      final sent = widget.type == 'direct'
+          ? await api.sendDirectMessage(
+              toUid: widget.conversationId,
+              body: body,
+              msgType: msgType,
+              mediaUrl: mediaUrl,
+            )
+          : await api.sendGroupMessage(
+              groupId: widget.conversationId,
+              body: body,
+              msgType: msgType,
+              mediaUrl: mediaUrl,
+            );
+      if (!mounted) return;
+      setState(() => _addLocalMessage(sent));
+      await _saveCachedMessages();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scheduleScrollToBottom();
+        if (mounted) _inputFocus.requestFocus();
+      });
+      widget.onMessageSent?.call();
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('发送失败: $e')));
+    }
+  }
+
+  Future<void> _sendAnyFile() async {
+    if (widget.type == 'direct' && !_isFriend) {
+      final shouldSend = await _showFriendRequestDialog();
+      if (shouldSend) await _sendFriendRequest(widget.conversationId);
+      return;
+    }
+    final result = await FilePicker.pickFile();
+    final path = result?.path;
+    if (path != null && path.isNotEmpty)
+      await _sendMediaFile(File(path), 'file');
   }
 
   // ★ 发红包
@@ -1140,21 +1357,23 @@ class _ChatPageState extends State<ChatPage>
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context), child: const Text('取消')),
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
           TextButton(
             onPressed: () {
               final amount = int.tryParse(amountC.text);
               final count = int.tryParse(countC.text) ?? 1;
               if (amount == null || amount <= 0) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('请输入有效金额')),
-                );
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('请输入有效金额')));
                 return;
               }
               if (widget.type == 'group' && count <= 0) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('请输入有效个数')),
-                );
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('请输入有效个数')));
                 return;
               }
               Navigator.pop(context, {
@@ -1182,9 +1401,16 @@ class _ChatPageState extends State<ChatPage>
         title: result['title']?.toString() ?? '恭喜发财',
       );
 
-      final packetId = data['packet_id'] ??
+      final rawPacketId =
+          data['packet_id'] ??
           data['packetId'] ??
-          DateTime.now().millisecondsSinceEpoch.toString();
+          data['id'] ??
+          (data['data'] is Map
+              ? data['data']['packet_id'] ?? data['data']['packetId']
+              : null);
+      final packetId = rawPacketId?.toString() ?? '';
+      if (packetId.isEmpty) throw Exception('服务器未返回红包 ID');
+
       final bodyJson = jsonEncode({
         'packet_id': packetId,
         'total_amount': amount,
@@ -1215,12 +1441,14 @@ class _ChatPageState extends State<ChatPage>
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _scheduleScrollToBottom();
       });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('红包已发送')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('红包已发送')));
       if (widget.onMessageSent != null) widget.onMessageSent!();
     } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('红包发送失败: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('红包发送失败: $e')));
     }
   }
 
@@ -1230,9 +1458,9 @@ class _ChatPageState extends State<ChatPage>
       final data = await api.claimRedPacket(packetId);
       final amount = data['amount'] ?? data['claimed_amount'] ?? 0;
       _claimedPackets.add(packetId);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('领取成功：$amount 旧币')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('领取成功：$amount 旧币')));
       _offset = 0;
       _hasMore = true;
       _messages.clear();
@@ -1241,11 +1469,13 @@ class _ChatPageState extends State<ChatPage>
     } catch (e) {
       String msg = e.toString();
       if (msg.contains('already claimed') || msg.contains('已领取')) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('该红包已被领取')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('该红包已被领取')));
       } else {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('领取失败: $e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('领取失败: $e')));
       }
     }
   }
@@ -1273,8 +1503,9 @@ class _ChatPageState extends State<ChatPage>
               onTap: () {
                 Navigator.pop(context);
                 Clipboard.setData(ClipboardData(text: displayText));
-                ScaffoldMessenger.of(context)
-                    .showSnackBar(const SnackBar(content: Text('已复制')));
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('已复制')));
               },
             ),
             if (msg.fromUid == context.read<AuthService>().userId &&
@@ -1302,14 +1533,11 @@ class _ChatPageState extends State<ChatPage>
       } else {
         await api.recallGroupMessage(msg.id);
       }
-      setState(() {
-        _messages.removeWhere((m) => m.id == msg.id);
-        _messageMap.remove(msg.id);
-        _messageKeys.remove(msg.id);
-      });
+      _onMessageRecalled(msg.id, '我');
     } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('撤回失败: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('撤回失败: $e')));
     }
   }
 
@@ -1319,24 +1547,34 @@ class _ChatPageState extends State<ChatPage>
       padding: const EdgeInsets.all(8),
       margin: const EdgeInsets.only(bottom: 4),
       decoration: BoxDecoration(
-          color: Colors.grey[200], borderRadius: BorderRadius.circular(8)),
+        color: Colors.grey[200],
+        borderRadius: BorderRadius.circular(8),
+      ),
       child: Row(
         children: [
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('引用: ${_quotedMessage!.fromUid}',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 12)),
-                Text(_getMessageDisplayText(_quotedMessage!),
-                    maxLines: 2, overflow: TextOverflow.ellipsis),
+                Text(
+                  '引用: ${_quotedMessage!.fromUid}',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+                Text(
+                  _getMessageDisplayText(_quotedMessage!),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ],
             ),
           ),
           IconButton(
-              icon: const Icon(Icons.close, size: 18),
-              onPressed: () => setState(() => _quotedMessage = null)),
+            icon: const Icon(Icons.close, size: 18),
+            onPressed: () => setState(() => _quotedMessage = null),
+          ),
         ],
       ),
     );
@@ -1354,8 +1592,9 @@ class _ChatPageState extends State<ChatPage>
               onTap: () async {
                 Navigator.pop(context);
                 final picker = ImagePicker();
-                final result =
-                    await picker.pickImage(source: ImageSource.gallery);
+                final result = await picker.pickImage(
+                  source: ImageSource.gallery,
+                );
                 if (result != null) _sendMediaFile(File(result.path), 'image');
               },
             ),
@@ -1365,9 +1604,22 @@ class _ChatPageState extends State<ChatPage>
               onTap: () async {
                 Navigator.pop(context);
                 final picker = ImagePicker();
-                final result =
-                    await picker.pickVideo(source: ImageSource.gallery);
+                final result = await picker.pickVideo(
+                  source: ImageSource.gallery,
+                );
                 if (result != null) _sendMediaFile(File(result.path), 'video');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.attach_file, color: Colors.orange),
+              title: const Text('文件'),
+              onTap: () async {
+                Navigator.pop(context);
+                final result = await FilePicker.pickFile();
+                final path = result?.path;
+                if (path != null && path.isNotEmpty) {
+                  await _sendMediaFile(File(path), 'file');
+                }
               },
             ),
             ListTile(
@@ -1385,7 +1637,7 @@ class _ChatPageState extends State<ChatPage>
   }
 
   // ★ 头像右键菜单（仅群聊有效）
-  void _insertMention(String name) {
+  void _insertMention(String name, {String? uid}) {
     final text = _inputController.text;
     final rawPosition = _inputController.selection.baseOffset;
     final position = rawPosition < 0 || rawPosition > text.length
@@ -1395,15 +1647,21 @@ class _ChatPageState extends State<ChatPage>
     final after = text.substring(position);
     final mention = '@$name ';
     final next = '$before$mention$after';
-    if (next.length > 400) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('消息最多 400 字')));
+    if (uid != null && uid.trim().isNotEmpty) {
+      _pendingMentions.removeWhere((item) => item['uid'] == uid.trim());
+      _pendingMentions.add({'uid': uid.trim(), 'name': name});
+    }
+    if (next.length > 2000) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('消息最多 2000 字')));
       return;
     }
     _inputController.value = TextEditingValue(
       text: next,
-      selection:
-          TextSelection.collapsed(offset: before.length + mention.length),
+      selection: TextSelection.collapsed(
+        offset: before.length + mention.length,
+      ),
     );
     _inputFocus.requestFocus();
   }
@@ -1453,7 +1711,7 @@ class _ChatPageState extends State<ChatPage>
 
       switch (value) {
         case 'mention':
-          _insertMention(name);
+          _insertMention(name, uid: uid);
           break;
         case 'friend':
           _sendFriendRequest(uid);
@@ -1466,17 +1724,176 @@ class _ChatPageState extends State<ChatPage>
           );
           break;
         case 'profile':
-          Navigator.pushNamed(
-            context,
-            '/user_profile',
-            arguments: uid,
-          );
+          Navigator.pushNamed(context, '/user_profile', arguments: uid);
           break;
       }
     });
   }
 
+  Future<List<String>> _clipboardFilePaths() async {
+    if (!Platform.isWindows) return const <String>[];
+    final opened = OpenClipboard(HWND(Pointer.fromAddress(0))).value;
+    if (!opened) return const <String>[];
+    try {
+      if (!IsClipboardFormatAvailable(CF_HDROP).value) return const <String>[];
+      final raw = GetClipboardData(CF_HDROP).value;
+      final drop = HDROP(raw);
+      if (!drop.isValid) return const <String>[];
+      const allFiles = 0xFFFFFFFF;
+      final count = DragQueryFile(
+        drop,
+        allFiles,
+        PWSTR(Pointer<Utf16>.fromAddress(0)),
+        0,
+      );
+      final paths = <String>[];
+      for (var index = 0; index < count; index++) {
+        final length = DragQueryFile(
+          drop,
+          index,
+          PWSTR(Pointer<Utf16>.fromAddress(0)),
+          0,
+        );
+        final buffer = calloc<Uint16>(length + 1);
+        try {
+          DragQueryFile(drop, index, PWSTR(buffer.cast<Utf16>()), length + 1);
+          final path = PWSTR(buffer.cast<Utf16>()).toDartString();
+          if (path.isNotEmpty) paths.add(path);
+        } finally {
+          calloc.free(buffer);
+        }
+      }
+      return paths;
+    } finally {
+      CloseClipboard();
+    }
+  }
+
+  Future<String?> _clipboardImageFile() async {
+    if (!Platform.isWindows) return null;
+    final temporaryDirectory = await getTemporaryDirectory();
+    final path =
+        '${temporaryDirectory.path}${Platform.pathSeparator}oldchat-paste-${DateTime.now().microsecondsSinceEpoch}.png';
+    const script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$path = $env:OLDCHAT_CLIPBOARD_PATH
+if ([Windows.Forms.Clipboard]::ContainsImage()) {
+  $image = [Windows.Forms.Clipboard]::GetImage()
+  $image.Save($path, [Drawing.Imaging.ImageFormat]::Png)
+  $image.Dispose()
+  Write-Output $path
+}
+''';
+    try {
+      final result = await Process.run(
+        'powershell.exe',
+        const ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
+        environment: {'OLDCHAT_CLIPBOARD_PATH': path},
+      );
+      if (result.exitCode == 0 && await File(path).exists()) return path;
+    } catch (error) {
+      debugPrint('[剪贴板图片] 读取失败：$error');
+    }
+    return null;
+  }
+
+  String _mediaTypeForFile(String path) {
+    final lower = path.toLowerCase();
+    if (RegExp(r'\.(png|jpe?g|gif|webp|bmp|heic|avif)$').hasMatch(lower))
+      return 'image';
+    if (RegExp(r'\.(mp4|mkv|mov|avi|webm|wmv|flv|m4v)$').hasMatch(lower))
+      return 'video';
+    return 'file';
+  }
+
+  Future<bool> _confirmClipboardSend(List<String> paths) async {
+    final names = paths
+        .map((path) => path.split(RegExp(r'[\\/]')).last)
+        .where((name) => name.isNotEmpty)
+        .toList();
+    if (!mounted) return false;
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('发送剪贴板内容？'),
+            content: Text(
+              paths.length == 1
+                  ? '检测到剪贴板中的${_mediaTypeForFile(paths.first) == 'image'
+                        ? '图片'
+                        : _mediaTypeForFile(paths.first) == 'video'
+                        ? '视频'
+                        : '文件'}：\n${names.first}'
+                  : '检测到剪贴板中的 ${paths.length} 个文件：\n${names.take(8).join('\n')}${names.length > 8 ? '\n……' : ''}',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('发送'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _handleClipboardPaste() async {
+    if (_clipboardPasteInFlight) return;
+    _clipboardPasteInFlight = true;
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      final text = data?.text;
+      if (text != null && text.isNotEmpty) {
+        final value = _inputController.value;
+        final selection = value.selection.isValid
+            ? value.selection
+            : TextSelection.collapsed(offset: value.text.length);
+        final start = selection.start.clamp(0, value.text.length);
+        final end = selection.end.clamp(start, value.text.length);
+        final newText = value.text.replaceRange(start, end, text);
+        _inputController.value = TextEditingValue(
+          text: newText,
+          selection: TextSelection.collapsed(offset: start + text.length),
+        );
+        return;
+      }
+
+      final paths = await _clipboardFilePaths();
+      if (paths.isNotEmpty) {
+        if (!await _confirmClipboardSend(paths)) return;
+        for (final path in paths) {
+          await _sendMediaFile(File(path), _mediaTypeForFile(path));
+        }
+        return;
+      }
+
+      final imagePath = await _clipboardImageFile();
+      if (imagePath == null) return;
+      try {
+        if (await _confirmClipboardSend([imagePath])) {
+          await _sendMediaFile(File(imagePath), 'image');
+        }
+      } finally {
+        try {
+          await File(imagePath).delete();
+        } catch (_) {}
+      }
+    } finally {
+      _clipboardPasteInFlight = false;
+    }
+  }
+
   KeyEventResult _handleComposerKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.keyV &&
+        HardwareKeyboard.instance.isControlPressed) {
+      unawaited(_handleClipboardPaste());
+      return KeyEventResult.handled;
+    }
     if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.enter) {
       if (HardwareKeyboard.instance.isShiftPressed) {
         return KeyEventResult.ignored;
@@ -1534,8 +1951,11 @@ class _ChatPageState extends State<ChatPage>
                           itemBuilder: (ctx, i) {
                             final msg = _messages[i];
                             final parsed = MessageParser.parseMessageBody(
-                                msg.body, msg.msgType);
-                            final isRedPacket = msg.msgType == 'red_packet' ||
+                              msg.body,
+                              msg.msgType,
+                            );
+                            final isRedPacket =
+                                msg.msgType == 'red_packet' ||
                                 (msg.msgType == 'text' &&
                                     parsed['redPacket'] != null);
                             final isClaimed = _claimedPackets.contains(
@@ -1543,9 +1963,17 @@ class _ChatPageState extends State<ChatPage>
                                   parsed['redPacket']?['packetId'],
                             );
 
-                            final bool showDateDivider = i == 0 ||
-                                !_isSameDay(
-                                    _messages[i - 1].createdAt, msg.createdAt);
+                            final previous = i == 0 ? null : _messages[i - 1];
+                            final gapSeconds = previous == null
+                                ? 0
+                                : msg.createdAt - previous.createdAt;
+                            final bool showDateDivider =
+                                previous == null || gapSeconds >= 15 * 60;
+                            final bool showAvatar = previous == null ||
+                                previous.fromUid != msg.fromUid ||
+                                gapSeconds >= 5 * 60 ||
+                                previous.msgType == 'system' ||
+                                msg.msgType == 'system';
 
                             return RepaintBoundary(
                               child: Column(
@@ -1554,10 +1982,13 @@ class _ChatPageState extends State<ChatPage>
                                   if (showDateDivider)
                                     Padding(
                                       padding: const EdgeInsets.symmetric(
-                                          vertical: 8),
+                                        vertical: 8,
+                                      ),
                                       child: Center(
                                         child: Text(
-                                          _formatDate(msg.createdAt),
+                                          previous == null
+                                              ? _formatDate(msg.createdAt)
+                                              : _formatDateTime(msg.createdAt),
                                           style: TextStyle(
                                             fontSize: 12,
                                             color: Colors.grey[500],
@@ -1570,12 +2001,15 @@ class _ChatPageState extends State<ChatPage>
                                     key: _messageKeys[msg.id],
                                     message: msg,
                                     isMe: msg.fromUid == userId,
+                                    showAvatar: showAvatar,
                                     onLongPress: () => _showMessageMenu(msg),
                                     onSecondaryTap: () => _showMessageMenu(msg),
                                     onQuoteTap: (quotedId) =>
                                         _scrollToMessage(quotedId),
+                                    onMessageAction: _handleMessageAction,
                                     onAvatarLongPress: widget.type == 'group'
-                                        ? (uid, name) => _insertMention(name)
+                                        ? (uid, name) =>
+                                              _insertMention(name, uid: uid)
                                         : null,
                                     onAvatarSecondaryTap: widget.type == 'group'
                                         ? _showAvatarMenu
@@ -1584,12 +2018,10 @@ class _ChatPageState extends State<ChatPage>
                                     isClaimed: isClaimed,
                                     onClaimRedPacket: isRedPacket
                                         ? () => _claimRedPacket(
-                                              parsed['redPacket']
-                                                      ?['packet_id'] ??
-                                                  parsed['redPacket']
-                                                      ?['packetId'] ??
-                                                  '',
-                                            )
+                                            parsed['redPacket']?['packet_id'] ??
+                                                parsed['redPacket']?['packetId'] ??
+                                                '',
+                                          )
                                         : null,
                                   ),
                                 ],
@@ -1613,8 +2045,9 @@ class _ChatPageState extends State<ChatPage>
                         borderRadius: BorderRadius.circular(20),
                         boxShadow: [
                           BoxShadow(
-                            color:
-                                Theme.of(context).primaryColor.withOpacity(.12),
+                            color: Theme.of(
+                              context,
+                            ).primaryColor.withOpacity(.12),
                             blurRadius: 12,
                             offset: const Offset(0, 3),
                           ),
@@ -1624,8 +2057,10 @@ class _ChatPageState extends State<ChatPage>
                         crossAxisAlignment: CrossAxisAlignment.center,
                         children: [
                           IconButton(
-                            icon: Icon(Icons.add_circle_outline,
-                                color: Theme.of(context).primaryColor),
+                            icon: Icon(
+                              Icons.add_circle_outline,
+                              color: Theme.of(context).primaryColor,
+                            ),
                             onPressed: _showSendOptions,
                             tooltip: '发送图片/视频/红包',
                           ),
@@ -1638,40 +2073,51 @@ class _ChatPageState extends State<ChatPage>
                                 scrollController: _composerScrollController,
                                 minLines: 1,
                                 maxLines: 6,
-                                maxLength: 400,
+                                maxLength: 2000,
                                 keyboardType: TextInputType.multiline,
                                 textInputAction: TextInputAction.newline,
                                 inputFormatters: [
-                                  LengthLimitingTextInputFormatter(400)
+                                  LengthLimitingTextInputFormatter(2000),
                                 ],
-                                buildCounter: (context,
-                                        {required currentLength,
-                                        required isFocused,
-                                        maxLength}) =>
-                                    Padding(
-                                  padding: const EdgeInsets.only(
-                                      right: 8, bottom: 2),
-                                  child: Text('$currentLength/400',
-                                      style: TextStyle(
+                                buildCounter:
+                                    (
+                                      context, {
+                                      required currentLength,
+                                      required isFocused,
+                                      maxLength,
+                                    }) => Padding(
+                                      padding: const EdgeInsets.only(
+                                        right: 8,
+                                        bottom: 2,
+                                      ),
+                                      child: Text(
+                                        '$currentLength/2000',
+                                        style: TextStyle(
                                           fontSize: 10,
-                                          color: Theme.of(context).hintColor)),
-                                ),
+                                          color: Theme.of(context).hintColor,
+                                        ),
+                                      ),
+                                    ),
                                 decoration: InputDecoration(
                                   hintText:
                                       widget.type == 'direct' && !_isFriend
-                                          ? '发送好友申请后才能聊天'
-                                          : '输入消息…（Enter 发送，Shift+Enter 换行）',
+                                      ? '发送好友申请后才能聊天'
+                                      : '输入消息…（Enter 发送，Shift+Enter 换行）',
                                   border: InputBorder.none,
                                   contentPadding: const EdgeInsets.symmetric(
-                                      horizontal: 8, vertical: 10),
+                                    horizontal: 8,
+                                    vertical: 10,
+                                  ),
                                 ),
                               ),
                             ),
                           ),
                           const SizedBox(width: 8),
                           IconButton(
-                            icon: Icon(Icons.send,
-                                color: Theme.of(context).primaryColor),
+                            icon: Icon(
+                              Icons.send,
+                              color: Theme.of(context).primaryColor,
+                            ),
                             onPressed: () =>
                                 _sendTextMessage(_inputController.text),
                           ),
@@ -1726,13 +2172,14 @@ class _ChatPageState extends State<ChatPage>
           Container(
             height: 48,
             padding: const EdgeInsets.symmetric(horizontal: 8),
-            decoration: BoxDecoration(
-              color: Theme.of(context).primaryColor,
-            ),
+            decoration: BoxDecoration(color: Theme.of(context).primaryColor),
             child: Row(
               children: [
-                const Icon(Icons.chat_bubble_outline,
-                    color: Colors.white, size: 20),
+                const Icon(
+                  Icons.chat_bubble_outline,
+                  color: Colors.white,
+                  size: 20,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -1762,8 +2209,11 @@ class _ChatPageState extends State<ChatPage>
                         _inputFocus.unfocus();
                         break;
                       case 'copy_id':
-                        Clipboard.setData(ClipboardData(
-                            text: '${widget.type}:${widget.conversationId}'));
+                        Clipboard.setData(
+                          ClipboardData(
+                            text: '${widget.type}:${widget.conversationId}',
+                          ),
+                        );
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(content: Text('已复制会话ID')),
                         );
@@ -1781,12 +2231,18 @@ class _ChatPageState extends State<ChatPage>
                     const PopupMenuItem(value: 'bottom', child: Text('回到底部')),
                     const PopupMenuItem(value: 'clear', child: Text('清空输入框')),
                     const PopupMenuItem(
-                        value: 'copy_id', child: Text('复制会话ID')),
+                      value: 'copy_id',
+                      child: Text('复制会话ID'),
+                    ),
                     if (widget.type == 'group')
                       const PopupMenuItem(
-                          value: 'group_tools', child: Text('群成员与群工具')),
+                        value: 'group_tools',
+                        child: Text('群成员与群工具'),
+                      ),
                     const PopupMenuItem(
-                        value: 'search_history', child: Text('搜索历史消息')),
+                      value: 'search_history',
+                      child: Text('搜索历史消息'),
+                    ),
                   ],
                 ),
               ],
@@ -1828,11 +2284,14 @@ class _ChatPageState extends State<ChatPage>
                   _inputFocus.unfocus();
                   break;
                 case 'copy_id':
-                  Clipboard.setData(ClipboardData(
-                      text: '${widget.type}:${widget.conversationId}'));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('已复制会话ID')),
+                  Clipboard.setData(
+                    ClipboardData(
+                      text: '${widget.type}:${widget.conversationId}',
+                    ),
                   );
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(const SnackBar(content: Text('已复制会话ID')));
                   break;
               }
             },
@@ -1843,9 +2302,13 @@ class _ChatPageState extends State<ChatPage>
               const PopupMenuItem(value: 'copy_id', child: Text('复制会话ID')),
               if (widget.type == 'group')
                 const PopupMenuItem(
-                    value: 'group_tools', child: Text('群成员与群工具')),
+                  value: 'group_tools',
+                  child: Text('群成员与群工具'),
+                ),
               const PopupMenuItem(
-                  value: 'search_history', child: Text('搜索历史消息')),
+                value: 'search_history',
+                child: Text('搜索历史消息'),
+              ),
             ],
           ),
         ],

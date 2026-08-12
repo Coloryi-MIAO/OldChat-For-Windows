@@ -17,16 +17,20 @@ import 'image_viewer.dart';
 import '../services/cache_service.dart';
 import '../services/image_cache_service.dart';
 import '../services/download_service.dart';
+import 'cached_image.dart';
+import 'download_progress_dialog.dart';
 
 class MessageTile extends StatefulWidget {
   final Message message;
   final bool isMe;
+  final bool showAvatar;
   final VoidCallback? onLongPress;
   final VoidCallback? onSecondaryTap;
   final void Function(String quotedId)? onQuoteTap;
   final void Function(String uid, String name)? onAvatarLongPress;
   final void Function(String uid, String name, Offset position)?
-      onAvatarSecondaryTap; // ★ 新增
+  onAvatarSecondaryTap; // ★ 新增
+  final Future<void> Function(String action, String data)? onMessageAction;
   final bool isRedPacket;
   final bool isClaimed;
   final VoidCallback? onClaimRedPacket;
@@ -35,11 +39,13 @@ class MessageTile extends StatefulWidget {
     super.key,
     required this.message,
     required this.isMe,
+    this.showAvatar = true,
     this.onLongPress,
     this.onSecondaryTap,
     this.onQuoteTap,
     this.onAvatarLongPress,
     this.onAvatarSecondaryTap,
+    this.onMessageAction,
     this.isRedPacket = false,
     this.isClaimed = false,
     this.onClaimRedPacket,
@@ -51,13 +57,30 @@ class MessageTile extends StatefulWidget {
 
 class _MessageTileState extends State<MessageTile> {
   static final Map<String, Map<String, dynamic>> _profileCache = {};
+  static final Map<String, Future<Map<String, dynamic>>> _profileRequests = {};
   String? _avatarUrl;
   String? _myAvatarUrl;
   String? _senderName;
+  String? _senderTitle;
   final Map<String, String> _mentionNameCache = {};
 
   final AudioService _audioService = AudioService();
 
+  static Future<Map<String, dynamic>> _getProfile(String uid) async {
+    final cached = _profileCache[uid];
+    if (cached != null) return cached;
+    final pending = _profileRequests[uid];
+    if (pending != null) return pending;
+    final request = ApiService().getUserProfile(uid);
+    _profileRequests[uid] = request;
+    try {
+      final profile = await request;
+      _profileCache[uid] = profile;
+      return profile;
+    } finally {
+      _profileRequests.remove(uid);
+    }
+  }
 
   @override
   void initState() {
@@ -102,12 +125,14 @@ class _MessageTileState extends State<MessageTile> {
     final fullUrl = resolveMediaUrl(url);
     try {
       if (await canLaunchUrl(Uri.parse(fullUrl))) {
-        await launchUrl(Uri.parse(fullUrl),
-            mode: LaunchMode.externalApplication);
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('无法打开浏览器')),
+        await launchUrl(
+          Uri.parse(fullUrl),
+          mode: LaunchMode.externalApplication,
         );
+      } else {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法打开浏览器')));
       }
     } catch (e) {}
   }
@@ -117,50 +142,113 @@ class _MessageTileState extends State<MessageTile> {
     final uid = msg.fromUid;
     if (uid.isEmpty) return;
     final auth = context.read<AuthService>();
-    if (uid == auth.userId) {
-      setState(() => _senderName = '我');
+    final currentUserId = auth.userId;
+    if (uid == currentUserId) {
+      final cachedSelf = _profileCache[uid];
+      if (cachedSelf != null) {
+        if (mounted) {
+          setState(() {
+            _senderName = '我';
+            _senderTitle = _cleanTitle(
+              cachedSelf['user_title'] ?? cachedSelf['title'],
+            );
+            _myAvatarUrl = cachedSelf['avatar_url'];
+          });
+        }
+        return;
+      }
+      try {
+        final profile = await _getProfile(uid);
+        _profileCache[uid] = profile;
+        if (mounted) {
+          setState(() {
+            _senderName = '我';
+            _senderTitle = _cleanTitle(
+              profile['user_title'] ?? profile['title'],
+            );
+            _myAvatarUrl = profile['avatar_url'];
+          });
+        }
+      } catch (_) {
+        if (mounted) setState(() => _senderName = '我');
+      }
       return;
     }
     final cachedProfile = _profileCache[uid];
     if (cachedProfile != null) {
       if (mounted) {
         setState(() {
-          _senderName =
-              cachedProfile['display_name'] ?? cachedProfile['username'] ?? uid;
+          _senderName = _profileLabel(cachedProfile, uid);
+          _senderTitle = _cleanTitle(
+            cachedProfile['user_title'] ?? cachedProfile['title'],
+          );
           _avatarUrl = cachedProfile['avatar_url'];
         });
       }
       return;
     }
     try {
-      final api = ApiService();
-      final profile = await api.getUserProfile(uid);
+      final profile = await _getProfile(uid);
       _profileCache[uid] = profile;
-      final userId = context.read<AuthService>().userId ?? 'guest';
+      final userId = currentUserId ?? 'guest';
       await CacheService().writeJson(
         CacheService().scoped(userId, 'profile:$uid'),
         profile,
       );
       if (mounted) {
         setState(() {
-          _senderName = profile['display_name'] ?? profile['username'] ?? uid;
+          _senderName = _profileLabel(profile, uid);
+          _senderTitle = _cleanTitle(profile['user_title'] ?? profile['title']);
           _avatarUrl = profile['avatar_url'];
         });
       }
     } catch (_) {
-      final userId = context.read<AuthService>().userId ?? 'guest';
+      final userId = currentUserId ?? 'guest';
       final cached = await CacheService().readJson(
         CacheService().scoped(userId, 'profile:$uid'),
       );
       if (cached is Map && mounted) {
         setState(() {
-          _senderName = cached['display_name'] ?? cached['username'] ?? uid;
+          _senderName = _profileLabel(Map<String, dynamic>.from(cached), uid);
+          _senderTitle = _cleanTitle(cached['user_title'] ?? cached['title']);
           _avatarUrl = cached['avatar_url'];
         });
       } else if (mounted) {
         setState(() => _senderName = uid);
       }
     }
+  }
+
+  String _profileLabel(Map<String, dynamic> profile, String fallback) {
+    final rawName = (profile['display_name'] ?? profile['username'] ?? fallback)
+        .toString()
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    final rawTitle = _cleanTitle(profile['user_title'] ?? profile['title']);
+    if (rawTitle != null && rawTitle.isNotEmpty && rawName.contains(' · ')) {
+      return rawName.split(' · ').first.trim();
+    }
+    return rawName.isEmpty ? fallback : rawName;
+  }
+
+  String? _cleanTitle(dynamic value) {
+    final normalized = value?.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized == null || normalized.isEmpty) return null;
+    final parts = normalized
+        .split(RegExp(r'\s*[·•|/]\s*'))
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty)
+        .toList();
+    var candidate = parts.isEmpty ? '' : parts.last;
+    if (parts.length > 1 && parts.last == parts[parts.length - 2]) {
+      candidate = parts.last;
+    }
+    if (candidate.isEmpty) return null;
+    final words = candidate.split(' ');
+    if (words.length > 1 && words.every((word) => word == words.first)) {
+      return words.first;
+    }
+    return candidate;
   }
 
   Future<String> _getMentionName(String uid) async {
@@ -173,8 +261,7 @@ class _MessageTileState extends State<MessageTile> {
       return '我';
     }
     try {
-      final api = ApiService();
-      final profile = await api.getUserProfile(uid);
+      final profile = await _getProfile(uid);
       final name = profile['display_name'] ?? profile['username'] ?? uid;
       _mentionNameCache[uid] = name;
       return name;
@@ -195,8 +282,7 @@ class _MessageTileState extends State<MessageTile> {
       return;
     }
     try {
-      final api = ApiService();
-      final profile = await api.getUserProfile(userId);
+      final profile = await _getProfile(userId);
       await CacheService().writeJson(
         CacheService().scoped(userId, 'profile:$userId'),
         profile,
@@ -229,18 +315,22 @@ class _MessageTileState extends State<MessageTile> {
 
   void _showImage(String url) {
     final fullUrl = resolveMediaUrl(url);
-    Navigator.push(context,
-        MaterialPageRoute(builder: (_) => ImageViewer(imageUrl: fullUrl)));
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => ImageViewer(imageUrl: fullUrl)),
+    );
   }
 
   Future<void> _saveImageToLocal(String url) async {
     final path = await ImageSaver.saveImage(url);
     if (path != null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('图片已保存到: $path')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('图片已保存到: $path')));
     } else {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('保存失败')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('保存失败')));
     }
   }
 
@@ -275,8 +365,8 @@ class _MessageTileState extends State<MessageTile> {
 
   String _getQuoteDisplayText(Map<String, dynamic> quote) {
     final quoteType = quote['type'] ?? 'text';
-    final quoteText =
-        (quote['text'] ?? quote['body'] ?? quote['content'] ?? '').toString();
+    final quoteText = (quote['text'] ?? quote['body'] ?? quote['content'] ?? '')
+        .toString();
     if (quoteType == 'image') return '[图片]';
     if (quoteType == 'video') return '[视频]';
     if (quoteType == 'voice') return '[语音]';
@@ -288,6 +378,16 @@ class _MessageTileState extends State<MessageTile> {
     final media = quote['media_url'] ?? quote['url'] ?? quote['mediaUrl'];
     if (media != null && media.toString().trim().isNotEmpty) {
       return quoteType == 'video' ? '[视频]' : '[媒体]';
+    }
+    final attachment = quote['attachment'] ?? quote['file'] ?? quote['media'];
+    if (attachment is Map && attachment.isNotEmpty) {
+      final attachmentName =
+          attachment['name'] ?? attachment['filename'] ?? attachment['title'];
+      if (attachmentName != null &&
+          attachmentName.toString().trim().isNotEmpty) {
+        return attachmentName.toString();
+      }
+      return '[媒体]';
     }
     return '[原消息内容不可用]';
   }
@@ -326,8 +426,8 @@ class _MessageTileState extends State<MessageTile> {
         _audioService.currentUrl == audio && _audioService.isPlaying;
     final double progress = _audioService.duration.inMilliseconds > 0
         ? (_audioService.position.inMilliseconds /
-                _audioService.duration.inMilliseconds)
-            .clamp(0.0, 1.0)
+                  _audioService.duration.inMilliseconds)
+              .clamp(0.0, 1.0)
         : 0.0;
     final String currentTimeStr = _formatVoiceTime(_audioService.position);
     final String totalTimeStr = _formatVoiceTime(_audioService.duration);
@@ -353,33 +453,45 @@ class _MessageTileState extends State<MessageTile> {
                 ClipRRect(
                   borderRadius: BorderRadius.circular(4),
                   child: cover.isNotEmpty
-                      ? Image.network(cover,
-                          width: 48, height: 48, fit: BoxFit.cover)
+                      ? Image.network(
+                          cover,
+                          width: 48,
+                          height: 48,
+                          fit: BoxFit.cover,
+                        )
                       : Container(
                           width: 48,
                           height: 48,
                           color: Colors.grey[600],
-                          child: const Icon(Icons.music_note)),
+                          child: const Icon(Icons.music_note),
+                        ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(title,
-                          style: const TextStyle(
-                              color: Colors.white, fontWeight: FontWeight.bold),
-                          maxLines: 1),
-                      Text(artist,
-                          style:
-                              TextStyle(color: Colors.grey[400], fontSize: 12),
-                          maxLines: 1),
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        maxLines: 1,
+                      ),
+                      Text(
+                        artist,
+                        style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                        maxLines: 1,
+                      ),
                     ],
                   ),
                 ),
                 IconButton(
-                  icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow,
-                      color: Colors.white),
+                  icon: Icon(
+                    isPlaying ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white,
+                  ),
                   onPressed: () {
                     if (audio.isNotEmpty) {
                       if (isPlaying) {
@@ -446,7 +558,7 @@ class _MessageTileState extends State<MessageTile> {
         _audioService.currentUrl == resolvedUrl && _audioService.isPlaying;
     final progress = _audioService.duration.inMilliseconds > 0
         ? _audioService.position.inMilliseconds /
-            _audioService.duration.inMilliseconds
+              _audioService.duration.inMilliseconds
         : 0.0;
 
     return GestureDetector(
@@ -454,9 +566,9 @@ class _MessageTileState extends State<MessageTile> {
         if (resolvedUrl.isNotEmpty) {
           _audioService.play(resolvedUrl);
         } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('语音链接无效')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('语音链接无效')));
         }
       },
       child: Container(
@@ -472,7 +584,9 @@ class _MessageTileState extends State<MessageTile> {
               children: [
                 Icon(
                   isThisPlaying ? Icons.pause : Icons.play_arrow,
-                  color: isThisPlaying ? Theme.of(context).colorScheme.primary : Colors.grey[700],
+                  color: isThisPlaying
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.grey[700],
                 ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -480,7 +594,9 @@ class _MessageTileState extends State<MessageTile> {
                     isThisPlaying ? '正在播放...' : durationStr,
                     style: TextStyle(
                       fontSize: 12,
-                      color: isThisPlaying ? Theme.of(context).colorScheme.primary : Colors.grey[700],
+                      color: isThisPlaying
+                          ? Theme.of(context).colorScheme.primary
+                          : Colors.grey[700],
                     ),
                   ),
                 ),
@@ -532,7 +648,9 @@ class _MessageTileState extends State<MessageTile> {
                   child: Text(
                     title,
                     style: const TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 14),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -557,7 +675,8 @@ class _MessageTileState extends State<MessageTile> {
                   displayText = '[视频]';
                 else if (type == 'voice')
                   displayText = '[语音]';
-                else if (type == 'file') displayText = '📄 [文件]';
+                else if (type == 'file')
+                  displayText = '📄 [文件]';
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 1),
                   child: Row(
@@ -565,13 +684,17 @@ class _MessageTileState extends State<MessageTile> {
                       Text(
                         '$fromName: ',
                         style: const TextStyle(
-                            fontSize: 12, fontWeight: FontWeight.w500),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                       Expanded(
                         child: Text(
                           displayText,
-                          style:
-                              TextStyle(fontSize: 12, color: Colors.grey[700]),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[700],
+                          ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
@@ -611,7 +734,9 @@ class _MessageTileState extends State<MessageTile> {
                   Text(
                     title,
                     style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.bold),
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   const Spacer(),
                   IconButton(
@@ -637,14 +762,17 @@ class _MessageTileState extends State<MessageTile> {
                       displayText = '[视频]';
                     else if (type == 'voice')
                       displayText = '[语音]';
-                    else if (type == 'file') displayText = '📄 [文件]';
+                    else if (type == 'file')
+                      displayText = '📄 [文件]';
                     return Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
                           '$fromName: ',
                           style: const TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 13),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
                         ),
                         Expanded(
                           child: Text(
@@ -695,6 +823,15 @@ class _MessageTileState extends State<MessageTile> {
     final text = parsed['text'] ?? '';
     final quote = parsed['quote'];
     final mentions = parsed['mentions'] as List? ?? [];
+    final buttons = (parsed['buttons'] as List?)?.whereType<Map>().toList() ?? const [];
+    if (parsed['recall'] == true) {
+      return Text(
+        text.toString().isEmpty
+            ? '${_senderName ?? msg.fromUid}撤回了一条消息'
+            : text.toString(),
+        style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
+      );
+    }
 
     if (_isForwardChat()) {
       final forwardData = _parseForwardData();
@@ -716,9 +853,9 @@ class _MessageTileState extends State<MessageTile> {
           if (url.isNotEmpty) {
             _showImage(url);
           } else {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('图片链接无效')),
-            );
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(const SnackBar(content: Text('图片链接无效')));
           }
         },
         child: Container(
@@ -733,9 +870,13 @@ class _MessageTileState extends State<MessageTile> {
             children: [
               const Icon(Icons.image, color: Colors.green, size: 18),
               const SizedBox(width: 8),
-              Text(trimmedText,
-                  style: const TextStyle(
-                      color: Colors.green, fontWeight: FontWeight.w500)),
+              Text(
+                trimmedText,
+                style: const TextStyle(
+                  color: Colors.green,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
               const Icon(Icons.chevron_right, color: Colors.grey, size: 16),
             ],
           ),
@@ -746,14 +887,20 @@ class _MessageTileState extends State<MessageTile> {
     String displayText = text;
     if (mentions.isNotEmpty) {
       for (var m in mentions) {
-        final uid = m['uid'] ?? '';
+        final uid = (m['uid'] ?? '').toString();
         if (uid.isNotEmpty) {
-          final name = _mentionNameCache[uid] ?? uid;
-          final regex = RegExp('@${m['name'] ?? uid}', caseSensitive: false);
-          displayText = displayText.replaceAllMapped(regex, (match) {
-            final isMe = uid == userId;
-            return '@${isMe ? '我' : name}';
-          });
+          final name = _mentionNameCache[uid] ?? (m['name'] ?? uid).toString();
+          final rawMentionName = (m['name'] ?? uid).toString();
+          final patterns = <RegExp>[
+            RegExp('@${RegExp.escape(rawMentionName)}', caseSensitive: false),
+            RegExp('@${RegExp.escape(uid)}', caseSensitive: false),
+          ];
+          for (final regex in patterns) {
+            displayText = displayText.replaceAllMapped(regex, (match) {
+              final isMe = uid == userId;
+              return '@${isMe ? '我' : name}';
+            });
+          }
         }
       }
     }
@@ -761,7 +908,9 @@ class _MessageTileState extends State<MessageTile> {
 
     final children = <Widget>[];
     if (quote != null) {
-      final quoteFrom = (quote['from_name'] ?? quote['sender'] ?? quote['from_uid'] ?? '未知').toString();
+      final quoteFrom =
+          (quote['from_name'] ?? quote['sender'] ?? quote['from_uid'] ?? '未知')
+              .toString();
       final quoteDisplayText = _getQuoteDisplayText(quote);
       children.add(
         GestureDetector(
@@ -775,8 +924,9 @@ class _MessageTileState extends State<MessageTile> {
             padding: const EdgeInsets.all(6),
             margin: const EdgeInsets.only(bottom: 4),
             decoration: BoxDecoration(
-                color: Colors.grey[300],
-                borderRadius: BorderRadius.circular(6)),
+              color: Colors.grey[300],
+              borderRadius: BorderRadius.circular(6),
+            ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -786,18 +936,25 @@ class _MessageTileState extends State<MessageTile> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('引用: $quoteFrom',
-                          style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 12,
-                              color: Colors.black87),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis),
-                      Text(quoteDisplayText,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 13, color: Colors.black54)),
+                      Text(
+                        '引用: $quoteFrom',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                          color: Colors.black87,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        quoteDisplayText,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: Colors.black54,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -810,8 +967,9 @@ class _MessageTileState extends State<MessageTile> {
 
     if (displayText.isNotEmpty) {
       if (displayText.contains('[歌词]') || displayText.contains('歌词:')) {
-        final lyricsText =
-            displayText.replaceAll(RegExp(r'\[歌词\]|歌词:'), '').trim();
+        final lyricsText = displayText
+            .replaceAll(RegExp(r'\[歌词\]|歌词:'), '')
+            .trim();
         if (lyricsText.isNotEmpty) {
           children.add(
             Container(
@@ -823,9 +981,10 @@ class _MessageTileState extends State<MessageTile> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('歌词',
-                      style:
-                          TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  const Text(
+                    '歌词',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                  ),
                   const SizedBox(height: 4),
                   Text(
                     lyricsText,
@@ -837,20 +996,59 @@ class _MessageTileState extends State<MessageTile> {
             ),
           );
           return Column(
-              crossAxisAlignment: CrossAxisAlignment.start, children: children);
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: children,
+          );
         }
       }
-      children.add(Text(displayText,
-          style: const TextStyle(fontSize: 14), softWrap: true));
+      children.add(
+        Text(displayText, style: const TextStyle(fontSize: 14), softWrap: true),
+      );
     } else if (quote == null) {
-      children.add(const Text('[空消息]',
-          style: TextStyle(fontSize: 14, color: Colors.grey)));
+      children.add(
+        const Text('[空消息]', style: TextStyle(fontSize: 14, color: Colors.grey)),
+      );
+    }
+    if (buttons.isNotEmpty) {
+      children.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: buttons.map((button) {
+              final label = (button['text'] ?? '').toString();
+              final action = (button['action'] ?? 'send_text').toString();
+              final data = (button['data'] ?? '').toString();
+              return OutlinedButton(
+                onPressed: widget.onMessageAction == null
+                    ? null
+                    : () => widget.onMessageAction!(action, data),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                  minimumSize: const Size(0, 32),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(label),
+              );
+            }).toList(),
+          ),
+        ),
+      );
     }
     return Column(
-        crossAxisAlignment: CrossAxisAlignment.start, children: children);
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
   }
 
   // ★ 红包卡片
+  String _senderLabel(String name) {
+    final title = _senderTitle?.trim();
+    if (title == null || title.isEmpty) return name;
+    return '$name · $title';
+  }
+
   Widget _buildRedPacketContent() {
     Map<String, dynamic>? redPacket;
 
@@ -869,17 +1067,21 @@ class _MessageTileState extends State<MessageTile> {
 
     if (redPacket == null) {
       return Container(
-        constraints:
-            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.3),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.3,
+        ),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: Colors.red,
           borderRadius: BorderRadius.circular(10),
-          gradient:
-              const LinearGradient(colors: [Colors.red, Colors.redAccent]),
+          gradient: const LinearGradient(
+            colors: [Colors.red, Colors.redAccent],
+          ),
         ),
-        child: const Text('红包',
-            style: TextStyle(color: Colors.white, fontSize: 16)),
+        child: const Text(
+          '红包',
+          style: TextStyle(color: Colors.white, fontSize: 16),
+        ),
       );
     }
 
@@ -895,7 +1097,8 @@ class _MessageTileState extends State<MessageTile> {
 
     final isOwn = widget.isMe;
     final isClaimed = widget.isClaimed || status == 'claimed';
-    final bool showClaimButton = !isOwn &&
+    final bool showClaimButton =
+        !isOwn &&
         !isClaimed &&
         widget.onClaimRedPacket != null &&
         packetId.isNotEmpty;
@@ -997,8 +1200,10 @@ class _MessageTileState extends State<MessageTile> {
               ),
               if (isClaimed)
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.white.withOpacity(0.2),
                     borderRadius: BorderRadius.circular(12),
@@ -1010,8 +1215,10 @@ class _MessageTileState extends State<MessageTile> {
                 )
               else if (isOwn)
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.white.withOpacity(0.15),
                     borderRadius: BorderRadius.circular(12),
@@ -1027,15 +1234,18 @@ class _MessageTileState extends State<MessageTile> {
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.white,
                     foregroundColor: Colors.red,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 4,
+                    ),
                     minimumSize: Size.zero,
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     visualDensity: VisualDensity.compact,
                   ),
-                  child: const Text('领取',
-                      style:
-                          TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                  child: const Text(
+                    '领取',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                  ),
                 ),
             ],
           ),
@@ -1072,45 +1282,76 @@ class _MessageTileState extends State<MessageTile> {
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
           child: Row(
-            mainAxisAlignment:
-                isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+            mainAxisAlignment: isMe
+                ? MainAxisAlignment.end
+                : MainAxisAlignment.start,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               if (!isMe)
-                GestureDetector(
-                  onLongPress: () {
-                    if (widget.onAvatarLongPress != null)
-                      widget.onAvatarLongPress!(msg.fromUid, senderDisplayName);
-                  },
-                  onTap: () => Navigator.pushNamed(context, '/user_profile',
-                      arguments: msg.fromUid),
-                  child: CircleAvatar(
-                    radius: 18,
-                    backgroundImage:
-                        _avatarUrl != null && _avatarUrl!.isNotEmpty
-                            ? NetworkImage(resolveMediaUrl(_avatarUrl!))
-                            : null,
-                    child: _avatarUrl == null || _avatarUrl!.isEmpty
-                        ? Text(senderDisplayName.isNotEmpty
-                            ? senderDisplayName.substring(0, 1)
-                            : '?')
-                        : null,
-                  ),
-                ),
+                widget.showAvatar
+                    ? GestureDetector(
+                        onLongPress: () {
+                          if (widget.onAvatarLongPress != null)
+                            widget.onAvatarLongPress!(msg.fromUid, senderDisplayName);
+                        },
+                        onTap: () => Navigator.pushNamed(
+                          context,
+                          '/user_profile',
+                          arguments: msg.fromUid,
+                        ),
+                        child: ClipOval(
+                          child: CachedImage(
+                            resolveMediaUrl(_avatarUrl ?? ''),
+                            width: 36,
+                            height: 36,
+                            cacheWidth: 120,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => CircleAvatar(
+                              radius: 18,
+                              child: Text(
+                                senderDisplayName.isNotEmpty
+                                    ? senderDisplayName.substring(0, 1)
+                                    : '?',
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                    : const SizedBox(width: 36, height: 36),
               const SizedBox(width: 8),
-              Flexible(child: _buildRedPacketContent()),
+              Flexible(
+                child: Column(
+                  crossAxisAlignment: isMe
+                      ? CrossAxisAlignment.end
+                      : CrossAxisAlignment.start,
+                  children: [
+                    if (!isMe && widget.showAvatar)
+                      Text(
+                        _senderLabel(senderDisplayName),
+                        style: const TextStyle(
+                          color: Colors.grey,
+                          fontSize: 11,
+                        ),
+                      ),
+                    _buildRedPacketContent(),
+                  ],
+                ),
+              ),
               if (isMe)
                 GestureDetector(
                   onTap: () => Navigator.pushNamed(context, '/profile'),
-                  child: CircleAvatar(
-                    radius: 18,
-                    backgroundImage:
-                        _myAvatarUrl != null && _myAvatarUrl!.isNotEmpty
-                            ? NetworkImage(resolveMediaUrl(_myAvatarUrl!))
-                            : null,
-                    child: _myAvatarUrl == null || _myAvatarUrl!.isEmpty
-                        ? const Text('我')
-                        : null,
+                  child: ClipOval(
+                    child: CachedImage(
+                      resolveMediaUrl(_myAvatarUrl ?? ''),
+                      width: 36,
+                      height: 36,
+                      cacheWidth: 120,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const CircleAvatar(
+                        radius: 18,
+                        child: Text('我'),
+                      ),
+                    ),
                   ),
                 ),
             ],
@@ -1132,17 +1373,19 @@ class _MessageTileState extends State<MessageTile> {
           onTap: () => _showImage(url),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(8),
-            child: Image(image: ImageCacheService.instance.provider(url, cacheWidth: 600),
+            child: Image(
+              image: ImageCacheService.instance.provider(url, cacheWidth: 600),
               width: 200,
               height: 200,
               fit: BoxFit.cover,
               loadingBuilder: (context, child, loadingProgress) {
                 if (loadingProgress == null) return child;
                 return Container(
-                    width: 200,
-                    height: 200,
-                    color: Colors.grey[300],
-                    child: const Center(child: CircularProgressIndicator()));
+                  width: 200,
+                  height: 200,
+                  color: Colors.grey[300],
+                  child: const Center(child: CircularProgressIndicator()),
+                );
               },
               errorBuilder: (_, __, ___) =>
                   const Icon(Icons.broken_image, size: 50),
@@ -1162,7 +1405,8 @@ class _MessageTileState extends State<MessageTile> {
 
       case 'file':
       case 'resource':
-        final isMusic = msg.mediaUrl != null &&
+        final isMusic =
+            msg.mediaUrl != null &&
             msg.mediaUrl!.isNotEmpty &&
             (msg.mediaUrl!.contains('.mp3') ||
                 msg.mediaUrl!.contains('.m4a') ||
@@ -1172,9 +1416,10 @@ class _MessageTileState extends State<MessageTile> {
         if (isMusic) {
           content = _buildMusicCard();
         } else {
-          final fileName = msg.body.isNotEmpty
-              ? msg.body
-              : (msg.mediaUrl?.split('/').last ?? '文件');
+          final fileName = DownloadService.fileNameFromMessage(
+            msg.body,
+            msg.mediaUrl,
+          );
           content = Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1186,24 +1431,12 @@ class _MessageTileState extends State<MessageTile> {
                   icon: const Icon(Icons.download, size: 18),
                   onPressed: () async {
                     final url = resolveMediaUrl(msg.mediaUrl!);
-                    try {
-                      final result = await DownloadService.download(
-                        url,
-                        fileName: fileName,
-                      );
-                      if (!mounted) return;
-                      final message = result.usedAria2
-                          ? '已交给 aria2 下载（任务 ${result.gid}）'
-                          : '已使用默认下载方式保存到：${result.path}';
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(message)),
-                      );
-                    } catch (e) {
-                      if (!mounted) return;
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('下载失败：$e')),
-                      );
-                    }
+                    await DownloadProgressDialog.show(
+                      context,
+                      url: url,
+                      fileName: fileName,
+                      title: '下载文件',
+                    );
                   },
                 ),
             ],
@@ -1237,38 +1470,53 @@ class _MessageTileState extends State<MessageTile> {
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
           child: Row(
-            mainAxisAlignment:
-                isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+            mainAxisAlignment: isMe
+                ? MainAxisAlignment.end
+                : MainAxisAlignment.start,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // ★ 头像（支持右键菜单）
               if (!isMe)
-                GestureDetector(
-                  onLongPress: () {
-                    if (widget.onAvatarLongPress != null) {
-                      widget.onAvatarLongPress!(msg.fromUid, senderDisplayName);
-                    }
-                  },
-                  // ★ 右键点击头像
-                  onSecondaryTapDown: (details) {
-                    if (widget.onAvatarSecondaryTap != null) {
-                      widget.onAvatarSecondaryTap!(msg.fromUid,
-                          senderDisplayName, details.globalPosition);
-                    }
-                  },
-                  onTap: () => Navigator.pushNamed(context, '/user_profile',
-                      arguments: msg.fromUid),
-                  child: CircleAvatar(
-                    radius: 18,
-                    backgroundImage:
-                        avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
-                    child: avatarUrl.isEmpty
-                        ? Text(senderDisplayName.isNotEmpty
-                            ? senderDisplayName.substring(0, 1)
-                            : '?')
-                        : null,
-                  ),
-                ),
+                widget.showAvatar
+                    ? GestureDetector(
+                        onLongPress: () {
+                          if (widget.onAvatarLongPress != null) {
+                            widget.onAvatarLongPress!(msg.fromUid, senderDisplayName);
+                          }
+                        },
+                        onSecondaryTapDown: (details) {
+                          if (widget.onAvatarSecondaryTap != null) {
+                            widget.onAvatarSecondaryTap!(
+                              msg.fromUid,
+                              senderDisplayName,
+                              details.globalPosition,
+                            );
+                          }
+                        },
+                        onTap: () => Navigator.pushNamed(
+                          context,
+                          '/user_profile',
+                          arguments: msg.fromUid,
+                        ),
+                        child: ClipOval(
+                          child: CachedImage(
+                            avatarUrl,
+                            width: 36,
+                            height: 36,
+                            cacheWidth: 120,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => CircleAvatar(
+                              radius: 18,
+                              child: Text(
+                                senderDisplayName.isNotEmpty
+                                    ? senderDisplayName.substring(0, 1)
+                                    : '?',
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                    : const SizedBox(width: 36, height: 36),
               const SizedBox(width: 8),
               Flexible(
                 child: ConstrainedBox(
@@ -1287,8 +1535,12 @@ class _MessageTileState extends State<MessageTile> {
                       ),
                       border: Border.all(
                         color: isMe
-                            ? Theme.of(context).colorScheme.primary.withOpacity(.55)
-                            : Theme.of(context).colorScheme.outline.withOpacity(.35),
+                            ? Theme.of(
+                                context,
+                              ).colorScheme.primary.withOpacity(.55)
+                            : Theme.of(
+                                context,
+                              ).colorScheme.outline.withOpacity(.35),
                       ),
                       boxShadow: const [
                         BoxShadow(
@@ -1302,32 +1554,85 @@ class _MessageTileState extends State<MessageTile> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         if (!isMe)
-                          Text(senderDisplayName,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.bold, fontSize: 12),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  senderDisplayName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              if (_senderTitle != null &&
+                                  _senderTitle!.trim().isNotEmpty) ...[
+                                const SizedBox(width: 6),
+                                Flexible(
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.primary.withOpacity(.12),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      _senderTitle!,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
                         const SizedBox(height: 4),
                         content,
                         const SizedBox(height: 4),
-                        Text(_formatTime(msg.createdAt),
-                            style: const TextStyle(
-                                fontSize: 10, color: Colors.grey)),
+                        Text(
+                          _formatTime(msg.createdAt),
+                          style: const TextStyle(
+                            fontSize: 10,
+                            color: Colors.grey,
+                          ),
+                        ),
                       ],
                     ),
                   ),
                 ),
               ),
               if (isMe)
-                GestureDetector(
-                  onTap: () => Navigator.pushNamed(context, '/profile'),
-                  child: CircleAvatar(
-                    radius: 18,
-                    backgroundImage:
-                        myAvatar.isNotEmpty ? NetworkImage(myAvatar) : null,
-                    child: myAvatar.isEmpty ? const Text('我') : null,
-                  ),
-                ),
+                widget.showAvatar
+                    ? GestureDetector(
+                        onTap: () => Navigator.pushNamed(context, '/profile'),
+                        child: ClipOval(
+                          child: CachedImage(
+                            myAvatar,
+                            width: 36,
+                            height: 36,
+                            cacheWidth: 120,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => const CircleAvatar(
+                              radius: 18,
+                              child: Text('我'),
+                            ),
+                          ),
+                        ),
+                      )
+                    : const SizedBox(width: 36, height: 36),
             ],
           ),
         ),
@@ -1475,7 +1780,11 @@ class _VideoFallback extends StatelessWidget {
   final String message;
   final String? thumbnailUrl;
 
-  const _VideoFallback({required this.url, required this.message, this.thumbnailUrl});
+  const _VideoFallback({
+    required this.url,
+    required this.message,
+    this.thumbnailUrl,
+  });
 
   Future<void> _open(BuildContext context) async {
     final uri = Uri.tryParse(resolveMediaUrl(url));
@@ -1491,7 +1800,11 @@ class _VideoFallback extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         if (thumbnailUrl != null && thumbnailUrl!.isNotEmpty)
-          Image.network(resolveMediaUrl(thumbnailUrl!), height: 100, fit: BoxFit.cover),
+          Image.network(
+            resolveMediaUrl(thumbnailUrl!),
+            height: 100,
+            fit: BoxFit.cover,
+          ),
         Text(message, style: const TextStyle(color: Colors.red, fontSize: 12)),
         Wrap(
           spacing: 8,
@@ -1532,11 +1845,11 @@ class _VideoBrowserButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Align(
-        alignment: Alignment.centerLeft,
-        child: TextButton.icon(
-          onPressed: url.isEmpty ? null : _open,
-          icon: const Icon(Icons.open_in_browser, size: 16),
-          label: const Text('用浏览器打开'),
-        ),
-      );
+    alignment: Alignment.centerLeft,
+    child: TextButton.icon(
+      onPressed: url.isEmpty ? null : _open,
+      icon: const Icon(Icons.open_in_browser, size: 16),
+      label: const Text('用浏览器打开'),
+    ),
+  );
 }

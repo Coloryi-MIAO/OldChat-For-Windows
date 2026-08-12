@@ -1,116 +1,208 @@
 # OldChat Desktop
 
-一个面向 Windows 的桌面聊天客户端，基于 Flutter 构建，提供私聊、群聊、动态、收藏、AI 助手和多媒体消息等功能。
+OldChat Desktop 是基于 Flutter 的 Windows 桌面聊天客户端，面向 OldChat 服务端提供私聊、群聊、动态、资源、音乐、表情和 AI 等功能。
 
-> 当前项目主要面向 **Windows Desktop**。
+> 当前只开发和支持 **Windows Desktop**。项目根目录的 `file api.md`、`file client.md` 和 `file routes.md` 是服务端接口与客户端协议的参考文档。
 
-## 功能特性
+## 功能
 
-- 私聊与群聊
-- WebSocket 实时消息接收，并在断线时使用轮询兜底
-- 未读消息与会话红点
-- 消息引用、撤回、复制、@成员和右键菜单
-- 聊天记录搜索
-- 群成员列表与成员资料
-- 动态发布、图片多选和图片浏览
-- 图片、头像与视频缩略图缓存
-- 视频缩略图预览、延迟加载播放器、浏览器打开和系统播放器打开
-- 音频消息播放
-- 文件下载，支持 Aria2；未配置 Aria2 时使用默认下载方式
-- 收藏消息与收藏内容查看
-- AI 助手、自定义 API URL、API Key 和模型选择
-- AI 会话保存与侧边栏切换
-- 粉色主题与主题切换
-- 桌面通知、通知音、系统托盘和单实例运行
-- 客户端缓存管理、缓存位置配置和 Windows DNS 缓存清理
+### 聊天
+
+- 私聊、群聊和 WebSocket 实时消息
+- WebSocket 断线重连、增量同步、轮询兜底和未读消息
+- 同一用户连续消息合并头像
+- 长时间无消息时显示时间分隔线
+- 消息撤回提示、引用、复制、搜索和右键菜单
+- @成员、红包、消息状态和会话红点
+- 发送文字、图片、视频、音频和文件
+- 图片、头像、视频缩略图和媒体缓存
+
+### 内容广场
+
+- 动态发布、图片选择、浏览、评论、点赞和分页加载
+- 资源广场的分区、上传、搜索、下载、收藏、点赞、评论和举报
+- 音乐广场的搜索、播放、封面缓存、歌词和播放进度同步
+- 表情广场的浏览、搜索、分页和缓存
+- 收藏消息及图片、视频、文本和文件链接
+- 公开法庭、签到墙和通知中心
+
+### 账户与客户端
+
+- 个人中心、好友、群组和成员资料管理
+- 设置中心和客户端缓存管理
+- AI 助手：自定义 API 地址、API Key、模型和本地会话
+- HarmonyOS Sans SC 中文字体
+- 粉色主题和其他主题设置
+- Windows 系统通知、通知音、系统托盘和单实例运行
+- Windows DNS 缓存清理
+
+### 下载与更新
+
+- 文件和媒体下载支持实时进度显示
+- 支持取消下载
+- 可选 Aria2 下载；未配置时使用客户端内置下载
+- 软件内流式检查、下载和安装更新
+- 更新前显示版本号、更新说明和下载进度
+- Windows 更新安装完成后自动重启客户端
+
+## 界面入口
+
+主窗口顶部保留三个按钮：
+
+- 刷新：刷新会话和未读消息
+- 功能：打开功能中心
+- 更多：打开更多功能中心
+
+功能中心和更多中心使用独立页面，不依赖容易被窗口裁切的弹出菜单。个人中心和设置页面都提供红色“退出登录”入口。
 
 ## 技术栈
 
 - Flutter / Dart
-- Dio：HTTP 网络请求
-- `web_socket_channel`：实时消息连接
+- Dio：HTTP 请求和流式下载
+- `web_socket_channel`：WebSocket 实时通信
 - Provider：状态管理
-- SharedPreferences：本地设置与轻量数据持久化
-- `media_kit` / `video_player` / Chewie：视频播放
+- SharedPreferences：设置和轻量本地数据
+- `path_provider`：Windows 文件路径
+- `video_player`、`media_kit`、`media_kit_video`、Chewie：视频播放
 - `audioplayers`：音频播放
-- `flutter_local_notifications`：桌面通知
-- `window_manager` / `tray_manager`：Windows 窗口与系统托盘
+- `flutter_local_notifications`、`win_toast`：Windows 通知
+- `window_manager`、`tray_manager`：窗口和系统托盘
+- `webview_windows`、`webview_flutter`：网页内容
+- `win32`、`ffi`：Windows 原生能力
 
 ## 环境要求
 
 - Windows 10 或更高版本
-- Flutter 3.44.7 或兼容的 Flutter 3.44.x 版本
-- Dart 3.12.x
+- Flutter 3.44.x，或与项目约束兼容的版本
+- Dart 3.10.x 或更高版本
 - Visual Studio 2022 或更高版本
-- 安装 **Desktop development with C++** 工作负载
+- Visual Studio 的 **Desktop development with C++** 工作负载
 - Git
 
-项目当前的 SDK 约束见 `file pubspec.yaml`。如果你使用其他 Flutter 版本，请先确认 Dart SDK 和依赖版本兼容。
+当前 SDK 和依赖约束以 `file pubspec.yaml` 为准。
 
 ## 获取项目
 
 ```bash
 git clone https://github.com/Coloryi-MIAO/OldChat-For-Windows.git
 cd oldchat_desktop
-```
-
-## 安装依赖
-
-```bash
 flutter pub get
 ```
 
-项目包含 Windows 视频播放依赖的本地副本：
-
-```text
-pub.dev 的 `media_kit_libs_windows_video`（在线依赖）
-```
-
-请确保这个目录随仓库一起保留，不要只提交 `file pubspec.yaml` 而遗漏其中的插件文件和媒体库归档。
-
-## 运行
+## 开发运行
 
 ```bash
 flutter run -d windows
 ```
 
+常用检查命令：
+
+```bash
+flutter analyze
+flutter test
+```
+
 ## 构建 Windows 版本
 
-建议在 Windows 终端中执行：
+建议在 Windows PowerShell 中使用干净的构建目录：
 
 ```powershell
 flutter clean
 Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force windows\flutter\ephemeral -ErrorAction SilentlyContinue
 flutter pub get
 flutter build windows --release
 ```
 
-生成文件通常位于：
+构建结果通常位于：
 
 ```text
 build\windows\x64\runner\Release
 ```
 
-如果出现 CMake 缓存来自其他电脑或其他目录的错误，先删除项目中的 `build` 目录，再重新执行构建。不要复制其他机器生成的 `build` 目录到当前项目。
+### 构建故障排查
 
-如果 `media_kit_libs_windows_video` 报下载或校验错误，请确认：
+如果出现 CMake 缓存来自其他电脑或其他目录的错误：
 
-1. 网络可以访问依赖下载地址；
-2. 本地插件目录完整；
-3. 已删除旧的 `build` 和 `windows\flutter\ephemeral` 后重新构建；
-4. Flutter、Dart 与 `pubspec.lock` 使用的依赖版本匹配。
+1. 删除项目中的 `build` 目录。
+2. 删除 `windows\flutter\ephemeral`。
+3. 重新执行 `flutter pub get`。
+4. 再执行 `flutter build windows --release`。
 
-## 配置服务器
+不要复制其他电脑生成的 `build`、`.dart_tool` 或 `windows\flutter\ephemeral` 目录。
 
-登录页支持配置 OldChat 服务地址。项目中的接口说明和路由说明见：
+如果 `media_kit_libs_windows_video` 出现下载、校验或 CMake 错误，请确认网络可以访问 pub.dev，然后按上面的步骤清理并重新构建。项目不需要提交本地插件副本。
 
-- `file api.md`
-- `file client.md`
-- `file routes.md`
+## 服务端配置
 
-不要把生产环境 Token、API Key、密码或其他凭据提交到 Git 仓库。
+登录页支持填写 OldChat 服务地址。服务端相关文档：
 
-## AI 助手配置
+- `file api.md`：接口、参数和响应格式
+- `file client.md`：客户端协议与行为说明
+- `file routes.md`：路由清单
+- `file lua-cip.md`：Lua 相关协议说明
+
+不要把生产环境 Token、密码、AI API Key 或其他凭据提交到 Git 仓库。
+
+### 服务端路由概览
+
+| 模块 | 路由范围 |
+| --- | --- |
+| 认证与连接 | `/v1/auth/*`、`GET /v1/ws`、`/v1/uploads/*` |
+| 当前用户与设备 | `/v1/me`、`/v1/me/*`、`/v1/ai/*`、`/v1/chat/completions` |
+| 好友与用户 | `/v1/users/profile`、`/v1/friends/*` |
+| 私聊与红包 | `/v1/direct/*`、`/v1/chats/*`、`/v1/redpackets/*` |
+| 群组与群消息 | `/v1/groups/*` |
+| 动态 | `/v1/moments/*` |
+| 资源广场 | `/v1/resources/*`、`/v1/me/resources/quota` |
+| 表情广场 | `/v1/emoji/plaza/*` |
+| 音乐广场 | `/v1/music/plaza/*`、`/v1/music/cover/*` |
+| 收藏、举报与反馈 | `/v1/favorites/*`、`/v1/reports/*`、`/v1/feedback` |
+| 通知 | `GET /v1/notifications` |
+| Lua 小程序 | `/v1/discover/lua/*` |
+
+主要接口包括：
+
+```text
+POST /v1/auth/register
+POST /v1/auth/login
+POST /v1/auth/refresh
+POST /v1/auth/logout
+GET  /v1/ws
+
+GET  /v1/me
+GET  /v1/friends
+POST /v1/friends/request
+POST /v1/friends/respond
+
+POST /v1/direct/send
+GET  /v1/direct/messages/v2
+GET  /v1/direct/messages/search
+POST /v1/direct/read
+
+POST /v1/groups/create
+POST /v1/groups/join
+GET  /v1/groups/list
+GET  /v1/groups/members
+POST /v1/groups/message/send
+GET  /v1/groups/messages/v2
+GET  /v1/groups/messages/after
+
+POST /v1/moments
+GET  /v1/moments/v2
+POST /v1/moments/like
+POST /v1/moments/comment
+
+POST /v1/resources/upload
+GET  /v1/resources/items
+GET  /v1/resources/search
+POST /v1/resources/like
+POST /v1/resources/comment
+```
+
+完整接口定义以项目内文档为准。
+
+## AI 助手
 
 AI 助手支持配置：
 
@@ -118,71 +210,68 @@ AI 助手支持配置：
 - API Key
 - 模型名称
 
-自定义 AI 配置用于直接请求用户填写的模型服务，不应把请求发送到 OldChat 服务端。具体兼容格式取决于所使用的 AI 服务接口。
+AI 会话默认保存在本地，可以从侧边栏切换和管理。API Key 属于敏感信息，不要提交到仓库或写入日志。
 
-## 缓存说明
+## 缓存
 
-Windows 客户端默认按用户保存缓存，目录位于：
+Windows 客户端默认按用户保存缓存：
 
 ```text
 C:\Users\<当前用户>\Documents\OldChat_Documents\<用户标识>
 ```
 
-缓存用于保存会话、消息、图片、头像、视频缩略图及部分客户端数据。缓存文件可能包含用户数据，客户端会对需要保护的本地数据进行加密处理。
+缓存可能包括：
+
+- 会话和消息
+- 图片、头像和视频缩略图
+- 音乐封面和歌词数据
+- 动态和表情广场数据
+- 其他客户端设置
 
 设置页提供：
 
-- 查看缓存大小
+- 查看客户端缓存大小
 - 清除客户端缓存
 - 选择缓存目录
 - 清除 Windows DNS 缓存
+- 开关系统通知和通知音
 
-缓存大小统计以客户端缓存目录中的实际文件为准；Windows 资源管理器显示的“占用空间”和“大小”可能因文件系统簇大小、隐藏文件或系统缓存而不同。
+清除缓存不会删除服务端数据，但会移除本地登录后的缓存内容；重新打开相关页面时，客户端会重新从服务端加载。
+
+## 项目结构
+
+```text
+lib/
+├── main.dart                    应用入口、主题和路由
+├── models/                      数据模型
+├── pages/                       页面
+├── services/                    网络、缓存、更新、音频和媒体服务
+├── theme/                       主题定义
+├── utils/                       工具类和消息解析
+└── widgets/                    可复用组件
+
+assets/                          字体、图标和图片资源
+windows/                         Windows Runner 和构建配置
+api.md                           API 文档
+client.md                        客户端协议文档
+routes.md                        服务端路由文档
+```
+
+## 安全与提交规范
+
+不要提交：
+
+- `build/`
+- `.dart_tool/`
+- `windows/flutter/ephemeral/`
+- 用户缓存
+- Token、密码、Cookie 和 API Key
+- 机器相关的 CMake 缓存
+
+更新 API、消息格式或服务端路由时，应同步检查 `file api.md`、`file client.md` 和 `file routes.md`。
 
 ## 开源协议
 
 本项目采用 [MIT License](LICENSE)。
 
-如果仓库中还没有 `LICENSE` 文件，请在项目根目录添加 MIT License 文件，并将年份和版权所有者替换为实际信息。
-
-```text
-MIT License
-
-Copyright (c) 2026 <你的名字或组织>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request。提交代码前请确认：
-
-```bash
-flutter analyze
-flutter test
-```
-
-请不要提交以下内容：
-
-- `build/`
-- `.dart_tool/`
-- 本地 IDE 配置
-- 用户缓存
-- Token、密码和 API Key
-- 机器相关的 CMake 缓存
+版权所有者：Coloryi

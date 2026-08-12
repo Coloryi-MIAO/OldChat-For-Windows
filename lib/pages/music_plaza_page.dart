@@ -1,11 +1,16 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:audioplayers/audioplayers.dart';
-import 'package:provider/provider.dart';
+import '../utils/constants.dart';
 import '../services/api_service.dart';
-import '../services/auth_service.dart';
 import '../services/audio_service.dart';
 import '../models/music.dart';
+import '../models/conversation.dart';
 import '../utils/url_helper.dart';
+import '../widgets/cached_image.dart';
+import '../widgets/image_viewer.dart';
+import '../services/auth_service.dart';
+import '../services/cache_service.dart';
+import '../services/image_cache_service.dart';
 
 enum MusicTab { plaza, ranking, mine }
 
@@ -30,10 +35,15 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
   final TextEditingController _searchController = TextEditingController();
   Music? _currentMusic;
   String _searchKeyword = '';
+  String? _lyrics;
+  bool _lyricsLoading = false;
+  int _lyricsIndex = 0;
+  String? _lyricsMusicId;
 
   @override
   void initState() {
     super.initState();
+    _restoreMusicCache();
     _loadMusic();
     _audioService.addListener(_onAudioStateChanged);
   }
@@ -47,19 +57,53 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
   }
 
   void _onAudioStateChanged() {
-    if (mounted) {
-      setState(() {});
+    if (!mounted) return;
+    final lines = _lyricLines(_lyrics);
+    var nextIndex = 0;
+    if (lines.isNotEmpty && _audioService.duration.inMilliseconds > 0) {
+      nextIndex = ((_audioService.position.inMilliseconds /
+                  _audioService.duration.inMilliseconds) *
+              lines.length)
+          .floor()
+          .clamp(0, lines.length - 1);
+    }
+    if (_lyricsIndex != nextIndex || _audioService.isPlaying) {
+      setState(() => _lyricsIndex = nextIndex);
     }
   }
 
   String _getEndpoint() {
     switch (_currentTab) {
       case MusicTab.ranking:
-        return '/v1/music/plaza/ranking';
+        return Constants.apiPath('/v1/music/plaza/ranking');
       case MusicTab.mine:
-        return '/v1/music/plaza/mine';
+        return Constants.apiPath('/v1/music/plaza/mine');
       default:
-        return '/v1/music/plaza';
+        return Constants.apiPath('/v1/music/plaza');
+    }
+  }
+  String _cacheKey() {
+    final userId = AuthService().userId ?? 'guest';
+    final tab = _currentTab.name;
+    final query = _searchKeyword.trim().isEmpty ? 'all' : _searchKeyword.trim();
+    return CacheService().scoped(userId, 'music-plaza:$tab:$query');
+  }
+
+  Future<void> _restoreMusicCache() async {
+    final cached = await CacheService().readJson(_cacheKey());
+    if (!mounted || cached is! Map) return;
+    final rawItems = cached['items'];
+    if (rawItems is! List || rawItems.isEmpty) return;
+    final items = rawItems.whereType<Map>().map((item) => Music.fromJson(Map<String, dynamic>.from(item))).toList();
+    if (items.isEmpty) return;
+    setState(() {
+      _musics = items;
+      _currentMusic ??= items.first;
+      _loading = false;
+    });
+    for (final music in items) {
+      final cover = resolveMediaUrl(music.coverUrl ?? music.avatarUrl);
+      if (cover.isNotEmpty) ImageCacheService.instance.cacheInBackground(cover);
     }
   }
 
@@ -90,7 +134,13 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
         endpoint: _getEndpoint(),
         query: _searchKeyword,
       );
-      final items = data['items'] ?? data['data'] ?? data['list'];
+      final items =
+          data['items'] ??
+          (data['response'] is Map
+              ? data['response']['items']
+              : data['response']) ??
+          (data['data'] is Map ? data['data']['items'] : data['data']) ??
+          data['list'];
       if (items == null) throw Exception('返回数据格式错误');
       if (data['error'] != null) throw Exception(data['error']);
       final newMusic = (items as List).map((e) => Music.fromJson(e)).toList();
@@ -110,31 +160,158 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
           _currentMusic = _musics[0];
         }
       });
+      await CacheService().writeJson(
+        _cacheKey(),
+        <String, dynamic>{
+          'items': _musics.map((music) => music.toJson()).toList(),
+          'has_more': _hasMore,
+        },
+      );
+      for (final music in newMusic) {
+        final cover = resolveMediaUrl(music.coverUrl ?? music.avatarUrl);
+        if (cover.isNotEmpty) ImageCacheService.instance.cacheInBackground(cover);
+      }
     } catch (e) {
+      final cached = await CacheService().readJson(_cacheKey());
+      if (initial && cached is Map && cached['items'] is List && mounted) {
+        final items = (cached['items'] as List)
+            .whereType<Map>()
+            .map((item) => Music.fromJson(Map<String, dynamic>.from(item)))
+            .toList();
+        if (items.isNotEmpty) {
+          setState(() {
+            _musics = items;
+            _currentMusic = items.first;
+            _loading = false;
+            _errorMessage = null;
+          });
+          return;
+        }
+      }
       setState(() {
         _loading = false;
         _isLoadingMore = false;
         _errorMessage = e.toString();
       });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载音乐失败: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('加载音乐失败: $e')));
       }
     }
+  }
+
+  Future<void> _loadLyrics(Music music) async {
+    if (music.lyrics?.trim().isNotEmpty == true) {
+      if (mounted) {
+        setState(() {
+          _lyrics = music.lyrics;
+          _lyricsMusicId = music.id;
+          _lyricsIndex = 0;
+        });
+      }
+      return;
+    }
+    if (music.lyricsUrl?.trim().isNotEmpty == true) {
+      try {
+        final text = await ApiService().getMusicLyricsText(resolveMediaUrl(music.lyricsUrl!));
+        if (mounted) {
+          setState(() {
+            _lyrics = text;
+            _lyricsMusicId = music.id;
+            _lyricsIndex = 0;
+          });
+        }
+        return;
+      } catch (_) {}
+    }
+    if (_lyricsLoading || music.id.isEmpty || _lyricsMusicId == music.id) return;
+    setState(() => _lyricsLoading = true);
+    try {
+      final data = await ApiService().getMusicLyrics(music.id);
+      final nested = data['data'];
+      final value = (data['lyrics'] ?? data['lyric'] ?? data['text'] ??
+              (nested is Map
+                  ? (nested['lyrics'] ?? nested['lyric'] ?? nested['text'])
+                  : nested))
+          ?.toString();
+      final lyricsUrl = (data['lyrics_url'] ?? data['lyric_url'] ?? data['url'])?.toString();
+      if (value != null && value.trim().isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            _lyrics = value;
+            _lyricsMusicId = music.id;
+            _lyricsIndex = 0;
+          });
+        }
+      } else if (lyricsUrl != null && lyricsUrl.trim().isNotEmpty) {
+        final lyricResponse = await ApiService().getExternalText(resolveMediaUrl(lyricsUrl));
+        if (mounted) {
+          setState(() {
+            _lyrics = lyricResponse;
+            _lyricsMusicId = music.id;
+            _lyricsIndex = 0;
+          });
+        }
+      } else if (mounted) {
+        setState(() {
+          _lyrics = null;
+          _lyricsMusicId = music.id;
+          _lyricsIndex = 0;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() { _lyrics = null; _lyricsMusicId = music.id; });
+    } finally {
+      if (mounted) setState(() => _lyricsLoading = false);
+    }
+  }
+
+  List<String> _lyricLines(String? value) => (value ?? '')
+      .split(RegExp(r'\r?\n'))
+      .map((line) => line.replaceFirst(RegExp(r'^\[[^\]]+\]'), '').trim())
+      .where((line) => line.isNotEmpty)
+      .toList();
+
+  Future<void> _showLyricsDialog(Music music) async {
+    if (_lyrics == null || _lyrics!.trim().isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('${music.title} · 歌词'),
+        content: SizedBox(
+          width: 520,
+          height: 520,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              _lyrics!,
+              style: const TextStyle(fontSize: 14, height: 1.7),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _playMusic(Music music) {
     final url = resolveMediaUrl(music.audioUrl);
     if (url.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('音频链接无效')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('音频链接无效')));
       return;
     }
     setState(() {
       _currentMusic = music;
+      _lyrics = music.lyrics;
+      _lyricsMusicId = music.id;
+      _lyricsLoading = false;
     });
+    _loadLyrics(music);
     _audioService.play(url);
   }
 
@@ -151,19 +328,97 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
     }
   }
 
-  void _shareMusic(Music music) {
-    final shareData = {
+  Future<Conversation?> _chooseConversation() async {
+    final api = ApiService();
+    final results = await Future.wait<dynamic>([api.getFriends(), api.getGroups()]);
+    if (!mounted) return null;
+    final friends = results[0] as List<Conversation>;
+    final groups = results[1] as List<Conversation>;
+    final all = [...friends, ...groups];
+    if (all.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('暂无可分享的聊天')),
+      );
+      return null;
+    }
+    return showDialog<Conversation>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('选择分享对象'),
+        content: SizedBox(
+          width: 420,
+          height: 420,
+          child: ListView(
+            children: [
+              if (friends.isNotEmpty)
+                const ListTile(title: Text('好友'), enabled: false),
+              ...friends.map((conversation) => ListTile(
+                    leading: const CircleAvatar(child: Icon(Icons.person)),
+                    title: Text(conversation.name ?? conversation.id),
+                    subtitle: const Text('私聊'),
+                    onTap: () => Navigator.pop(dialogContext, conversation),
+                  )),
+              if (groups.isNotEmpty)
+                const ListTile(title: Text('群聊'), enabled: false),
+              ...groups.map((conversation) => ListTile(
+                    leading: const CircleAvatar(child: Icon(Icons.groups)),
+                    title: Text(conversation.name ?? conversation.id),
+                    subtitle: const Text('群聊'),
+                    onTap: () => Navigator.pop(dialogContext, conversation),
+                  )),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _shareMusic(Music music) async {
+    final target = await _chooseConversation();
+    if (target == null) return;
+    final body = jsonEncode({
       'v': 2,
       'text':
-          '歌曲: ${music.title}\n歌手: ${music.artist ?? '未知'}\n时长: ${_formatDuration(music.duration)}',
+          '歌曲: ${music.title}\n歌手: ${music.artist ?? '未知'}\n时长: ${_formatDuration(music.duration)}\n点击播放',
       'media_kind': 'music',
-      'song_url': music.audioUrl,
-      'url': music.audioUrl,
-      'cover': music.coverUrl,
-      'artist': music.artist ?? '未知',
-      'duration': _formatDuration(music.duration),
-    };
-    Navigator.pop(context, shareData);
+    });
+    try {
+      final api = ApiService();
+      if (target.type == 'direct') {
+        await api.sendDirectMessage(
+          toUid: target.id,
+          body: body,
+          msgType: 'resource',
+          mediaUrl: music.audioUrl ?? '',
+          thumbUrl: music.coverUrl ?? '',
+        );
+      } else {
+        await api.sendGroupMessage(
+          groupId: target.id,
+          body: body,
+          msgType: 'resource',
+          mediaUrl: music.audioUrl ?? '',
+          thumbUrl: music.coverUrl ?? '',
+        );
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已分享给 ${target.name ?? target.id}')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('分享失败: $error')),
+        );
+      }
+    }
   }
 
   Widget _buildMusicListItem(Music music, Color primaryColor) {
@@ -173,18 +428,32 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
         music.artist ?? music.displayName ?? music.username ?? '未知歌手';
 
     return ListTile(
-      leading: ClipRRect(
+      leading: InkWell(
         borderRadius: BorderRadius.circular(4),
-        child: Image.network(
-          coverUrl.isNotEmpty ? coverUrl : 'https://via.placeholder.com/48',
+        onTap: coverUrl.isEmpty
+            ? null
+            : () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ImageViewer(
+                      imageUrl: coverUrl,
+                      imageUrls: music.coverUrls,
+                    ),
+                  ),
+                ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: CachedImage(
+          coverUrl.isNotEmpty ? coverUrl : '',
           width: 48,
           height: 48,
-          fit: BoxFit.cover,
-          errorBuilder: (_, __, ___) => Container(
-            width: 48,
-            height: 48,
-            color: Colors.grey[300],
-            child: const Icon(Icons.music_note, size: 24),
+          cacheWidth: 160,
+            errorBuilder: (_, __, ___) => Container(
+              width: 48,
+              height: 48,
+              color: Colors.grey[300],
+              child: const Icon(Icons.music_note, size: 24),
+            ),
           ),
         ),
       ),
@@ -244,135 +513,180 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
 
     final music = _currentMusic!;
     final coverUrl = resolveMediaUrl(music.coverUrl ?? music.avatarUrl);
-    final artist =
-        music.artist ?? music.displayName ?? music.username ?? '未知歌手';
-    final isPlaying =
-        _audioService.currentUrl == resolveMediaUrl(music.audioUrl) &&
-            _audioService.isPlaying;
+    final artist = music.artist ?? music.displayName ?? music.username ?? '未知歌手';
+    final isPlaying = _audioService.currentUrl == resolveMediaUrl(music.audioUrl) && _audioService.isPlaying;
     final progress = _audioService.duration.inMilliseconds > 0
-        ? (_audioService.position.inMilliseconds /
-                _audioService.duration.inMilliseconds)
-            .clamp(0.0, 1.0)
+        ? (_audioService.position.inMilliseconds / _audioService.duration.inMilliseconds).clamp(0.0, 1.0)
         : 0.0;
     final currentTime = _audioService.position;
     final totalTime = _audioService.duration;
 
-    return Container(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          // 封面
-          ClipRRect(
-            borderRadius: BorderRadius.circular(12),
-            child: Image.network(
-              coverUrl.isNotEmpty
-                  ? coverUrl
-                  : 'https://via.placeholder.com/200',
-              width: 200,
-              height: 200,
-              fit: BoxFit.cover,
-              errorBuilder: (_, __, ___) => Container(
-                width: 200,
-                height: 200,
-                color: Colors.grey[300],
-                child: const Icon(Icons.music_note, size: 60),
-              ),
-            ),
-          ),
-          const SizedBox(height: 20),
-          // 歌曲信息
-          Text(
-            music.title,
-            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            artist,
-            style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 12),
-          // 进度条
-          Row(
-            children: [
-              Text(
-                _formatDuration(currentTime.inSeconds),
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-              Expanded(
-                child: Slider(
-                  value: progress,
-                  onChanged: (value) {
-                    final seekTo = totalTime * value;
-                    _audioService.seek(seekTo);
-                  },
-                  activeColor: Theme.of(context).primaryColor,
-                  inactiveColor: Colors.grey[300],
-                  min: 0,
-                  max: 1,
-                ),
-              ),
-              Text(
-                _formatDuration(totalTime.inSeconds),
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-            ],
-          ),
-          // 控制按钮
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                icon: const Icon(Icons.skip_previous, size: 32),
-                onPressed: () {
-                  final index = _musics.indexOf(music);
-                  if (index > 0) {
-                    _playMusic(_musics[index - 1]);
-                  }
-                },
-              ),
-              const SizedBox(width: 16),
-              CircleAvatar(
-                radius: 30,
-                backgroundColor: Theme.of(context).primaryColor,
-                child: IconButton(
-                  icon: Icon(
-                    isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                    size: 32,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxHeight < 620;
+        final coverSize = compact ? 128.0 : 200.0;
+        final lyricLines = _lyricLines(_lyrics);
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: coverUrl.isEmpty
+                        ? null
+                        : () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ImageViewer(
+                                  imageUrl: coverUrl,
+                                  imageUrls: music.coverUrls,
+                                ),
+                              ),
+                            ),
+                    child: CachedImage(
+                      coverUrl,
+                      width: coverSize,
+                      height: coverSize,
+                      cacheWidth: 640,
+                      errorBuilder: (_, __, ___) => Container(
+                        width: coverSize,
+                        height: coverSize,
+                        color: Colors.grey[300],
+                        child: Icon(Icons.music_note, size: 60),
+                      ),
+                    ),
                   ),
-                  onPressed: _togglePlay,
                 ),
-              ),
-              const SizedBox(width: 16),
-              IconButton(
-                icon: const Icon(Icons.skip_next, size: 32),
-                onPressed: () {
-                  final index = _musics.indexOf(music);
-                  if (index < _musics.length - 1) {
-                    _playMusic(_musics[index + 1]);
-                  }
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          // 分享按钮
-          OutlinedButton.icon(
-            onPressed: () => _shareMusic(music),
-            icon: const Icon(Icons.share, size: 18),
-            label: const Text('分享到聊天'),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: Theme.of(context).primaryColor,
-              side: BorderSide(color: Theme.of(context).primaryColor),
+                const SizedBox(height: 10),
+                Text(
+                  music.title,
+                  style: TextStyle(fontSize: compact ? 17 : 20, fontWeight: FontWeight.bold),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  artist,
+                  style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Text(_formatDuration(currentTime.inSeconds), style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                    Expanded(
+                      child: Slider(
+                        value: progress,
+                        onChanged: (value) => _audioService.seek(totalTime * value),
+                        activeColor: Theme.of(context).primaryColor,
+                        inactiveColor: Colors.grey[300],
+                        min: 0,
+                        max: 1,
+                      ),
+                    ),
+                    Text(_formatDuration(totalTime.inSeconds), style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                  ],
+                ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.skip_previous, size: 32),
+                      onPressed: () {
+                        final index = _musics.indexOf(music);
+                        if (index > 0) _playMusic(_musics[index - 1]);
+                      },
+                    ),
+                    const SizedBox(width: 16),
+                    CircleAvatar(
+                      radius: 30,
+                      backgroundColor: Theme.of(context).primaryColor,
+                      child: IconButton(
+                        icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 32),
+                        onPressed: _togglePlay,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    IconButton(
+                      icon: const Icon(Icons.skip_next, size: 32),
+                      onPressed: () {
+                        final index = _musics.indexOf(music);
+                        if (index < _musics.length - 1) _playMusic(_musics[index + 1]);
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                if (_lyricsLoading)
+                  const LinearProgressIndicator()
+                else if (lyricLines.isNotEmpty)
+                  Column(
+                    children: [
+                      Container(
+                        width: double.infinity,
+                        constraints: const BoxConstraints(maxHeight: 96),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primaryContainer.withOpacity(.45),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Builder(
+                          builder: (context) {
+                            final active = _lyricsIndex.clamp(0, lyricLines.length - 1);
+                            return SingleChildScrollView(
+                              child: Column(
+                                children: lyricLines.asMap().entries.map((entry) {
+                                  final selected = entry.key == active;
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 3),
+                                    child: Text(
+                                      entry.value,
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                        fontSize: selected ? 14 : 13,
+                                        fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                                        color: selected ? Theme.of(context).primaryColor : null,
+                                      ),
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton.icon(
+                          onPressed: () => _showLyricsDialog(music),
+                          icon: const Icon(Icons.open_in_full, size: 16),
+                          label: const Text('展开歌词'),
+                        ),
+                      ),
+                    ],
+                  )
+                else
+                  const Text('暂无歌词', style: TextStyle(color: Colors.grey)),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () => _shareMusic(music),
+                  icon: const Icon(Icons.share, size: 18),
+                  label: const Text('分享到聊天'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Theme.of(context).primaryColor,
+                    side: BorderSide(color: Theme.of(context).primaryColor),
+                  ),
+                ),
+              ],
             ),
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -401,8 +715,10 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
               children: [
                 // Tab切换
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   child: Row(
                     children: [
                       _buildTabButton('广场', MusicTab.plaza),
@@ -420,9 +736,12 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
                         hintText: '搜索音乐',
                         isDense: true,
                         contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 8),
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
                         border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(18)),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
                       ),
                       onSubmitted: (_) => _performSearch(),
                     ),
@@ -433,72 +752,71 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
                   child: _loading
                       ? const Center(child: CircularProgressIndicator())
                       : _errorMessage != null
-                          ? Center(
-                              child: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(Icons.error_outline,
-                                      size: 48, color: Colors.grey[400]),
-                                  const SizedBox(height: 8),
-                                  Text(_errorMessage!,
-                                      style:
-                                          TextStyle(color: Colors.grey[600])),
-                                  const SizedBox(height: 8),
-                                  TextButton(
-                                    onPressed: () => _loadMusic(initial: true),
-                                    child: const Text('重试'),
-                                  ),
-                                ],
+                      ? Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.error_outline,
+                                size: 48,
+                                color: Colors.grey[400],
                               ),
-                            )
-                          : _musics.isEmpty
-                              ? Center(
-                                  child: Text(
-                                    _currentTab == MusicTab.mine
-                                        ? '暂无上传的音乐'
-                                        : '暂无音乐',
-                                    style: TextStyle(color: Colors.grey[600]),
+                              const SizedBox(height: 8),
+                              Text(
+                                _errorMessage!,
+                                style: TextStyle(color: Colors.grey[600]),
+                              ),
+                              const SizedBox(height: 8),
+                              TextButton(
+                                onPressed: () => _loadMusic(initial: true),
+                                child: const Text('重试'),
+                              ),
+                            ],
+                          ),
+                        )
+                      : _musics.isEmpty
+                      ? Center(
+                          child: Text(
+                            _currentTab == MusicTab.mine ? '暂无上传的音乐' : '暂无音乐',
+                            style: TextStyle(color: Colors.grey[600]),
+                          ),
+                        )
+                      : ListView.builder(
+                          controller: _listScrollController,
+                          itemCount: _musics.length + (_hasMore ? 1 : 0),
+                          itemBuilder: (context, index) {
+                            if (index == _musics.length) {
+                              if (_isLoadingMore) {
+                                return const Padding(
+                                  padding: EdgeInsets.all(16),
+                                  child: Center(
+                                    child: CircularProgressIndicator(),
                                   ),
-                                )
-                              : ListView.builder(
-                                  controller: _listScrollController,
-                                  itemCount:
-                                      _musics.length + (_hasMore ? 1 : 0),
-                                  itemBuilder: (context, index) {
-                                    if (index == _musics.length) {
-                                      if (_isLoadingMore) {
-                                        return const Padding(
-                                          padding: EdgeInsets.all(16),
-                                          child: Center(
-                                              child:
-                                                  CircularProgressIndicator()),
-                                        );
-                                      }
-                                      return Padding(
-                                        padding: const EdgeInsets.all(8),
-                                        child: Center(
-                                          child: TextButton(
-                                            onPressed: () =>
-                                                _loadMusic(initial: false),
-                                            child: const Text('加载更多'),
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                    return _buildMusicListItem(
-                                        _musics[index], primaryColor);
-                                  },
+                                );
+                              }
+                              return Padding(
+                                padding: const EdgeInsets.all(8),
+                                child: Center(
+                                  child: TextButton(
+                                    onPressed: () => _loadMusic(initial: false),
+                                    child: const Text('加载更多'),
+                                  ),
                                 ),
+                              );
+                            }
+                            return _buildMusicListItem(
+                              _musics[index],
+                              primaryColor,
+                            );
+                          },
+                        ),
                 ),
               ],
             ),
           ),
           // 右侧播放器
           Expanded(
-            child: Container(
-              color: Colors.grey[50],
-              child: _buildPlayer(),
-            ),
+            child: Container(color: Colors.grey[50], child: _buildPlayer()),
           ),
         ],
       ),
@@ -541,14 +859,16 @@ class _MusicPlazaPageState extends State<MusicPlazaPage> {
                 ? Theme.of(context).primaryColor
                 : Colors.transparent,
             foregroundColor: isSelected ? Colors.white : Colors.grey[700],
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
             minimumSize: const Size(0, 36),
             padding: const EdgeInsets.symmetric(horizontal: 8),
           ),
-          child: Text(label,
-              style:
-                  const TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+          ),
         ),
       ),
     );

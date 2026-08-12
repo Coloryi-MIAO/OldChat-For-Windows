@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'auth_service.dart';
 
 class Aria2Service {
   static final Aria2Service _instance = Aria2Service._internal();
@@ -16,25 +17,75 @@ class Aria2Service {
     return {
       'endpoint': prefs.getString(endpointKey) ?? defaultEndpoint,
       'secret': prefs.getString(secretKey) ?? '',
+      'configured': (prefs.getBool('aria2_configured') ?? false).toString(),
     };
+  }
+
+  Future<Map<String, String>> loadSettings() => settings();
+
+  Future<bool> get isConfigured async {
+    final config = await settings();
+    final endpoint = config['endpoint']?.trim() ?? '';
+    if (config['configured'] != 'true' || endpoint.isEmpty) return false;
+    return _isEndpointReachable(endpoint, config['secret']?.trim() ?? '');
+  }
+
+  Future<bool> _isEndpointReachable(String endpoint, String secret) async {
+    if (endpoint.isEmpty) return false;
+    try {
+      final params = <dynamic>[
+        if (secret.isNotEmpty)
+          secret.startsWith('token:') ? secret : 'token:$secret',
+      ];
+      final response = await Dio(BaseOptions(
+        connectTimeout: const Duration(milliseconds: 800),
+        receiveTimeout: const Duration(milliseconds: 800),
+      )).post(endpoint, data: jsonEncode({
+        'jsonrpc': '2.0',
+        'id': 'oldchat-test',
+        'method': 'aria2.getVersion',
+        'params': params,
+      }));
+      final data = response.data is String ? jsonDecode(response.data) : response.data;
+      return data is Map && data['error'] == null;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> saveSettings({required String endpoint, required String secret}) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(endpointKey, endpoint.trim().isEmpty ? defaultEndpoint : endpoint.trim());
-    await prefs.setString(secretKey, secret.trim());
+    final normalizedEndpoint = endpoint.trim();
+    final normalizedSecret = secret.trim();
+    await prefs.setString(
+      endpointKey,
+      normalizedEndpoint.isEmpty ? defaultEndpoint : normalizedEndpoint,
+    );
+    await prefs.setString(secretKey, normalizedSecret);
+    await prefs.setBool(
+      'aria2_configured',
+      normalizedEndpoint.isNotEmpty,
+    );
   }
 
   Future<String> addUri(String url, {String? fileName}) async {
     final value = url.trim();
     if (value.isEmpty) throw Exception('下载地址为空');
     final config = await settings();
-    final options = <String, String>{};
+    final secret = config['secret']!.trim();
+    final rpcToken = secret.isEmpty
+        ? null
+        : (secret.startsWith('token:') ? secret : 'token:$secret');
+    final options = <String, dynamic>{};
     if (fileName != null && fileName.trim().isNotEmpty) {
       options['out'] = fileName.trim();
     }
+    final accessToken = AuthService().token;
+    if (accessToken != null && accessToken.isNotEmpty) {
+      options['http-header'] = <String>['Authorization: Bearer $accessToken'];
+    }
     final params = <dynamic>[
-      if (config['secret']!.isNotEmpty) 'token:${config['secret']}',
+      if (rpcToken != null) rpcToken,
       [value],
       options,
     ];

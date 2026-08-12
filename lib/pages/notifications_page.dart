@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../services/api_service.dart';
 import '../models/notification.dart';
+import '../utils/url_helper.dart';
+import '../widgets/cached_image.dart';
+import '../widgets/image_viewer.dart';
 
 class NotificationsPage extends StatefulWidget {
   const NotificationsPage({super.key});
@@ -22,11 +25,14 @@ class _NotificationsPageState extends State<NotificationsPage> {
   List<Map<String, dynamic>> _friendRequests = [];
   // ★ 已处理过的申请ID集合（用于去重）
   Set<String> _processedRequestIds = {};
+  List<Map<String, dynamic>> _groupRequests = [];
+  Set<String> _processedGroupRequestIds = {};
 
   @override
   void initState() {
     super.initState();
     _loadFriendRequests();
+    _loadGroupRequests();
     _loadNotifications();
   }
 
@@ -34,30 +40,73 @@ class _NotificationsPageState extends State<NotificationsPage> {
   Future<void> _loadFriendRequests() async {
     try {
       final api = ApiService();
-      // 获取好友列表
       final friends = await api.getFriends();
       final friendUids = friends.map((f) => f.id).toSet();
-
-      // 获取好友申请
       final data = await api.getFriendRequests();
-      final allRequests = (data['requests'] as List?)
-              ?.map((e) => e as Map<String, dynamic>)
+      final allRequests =
+          (data['requests'] as List?)
+              ?.whereType<Map>()
+              .map((e) => Map<String, dynamic>.from(e))
               .toList() ??
           [];
-
-      // 过滤：只保留 pending 状态，且对方还不是好友的申请
       final filtered = allRequests.where((r) {
         if (r['status'] != 'pending') return false;
         if (friendUids.contains(r['from_uid'])) return false;
-        if (_processedRequestIds.contains(r['id'])) return false;
+        if (_processedRequestIds.contains('${r['id'] ?? ''}')) return false;
         return true;
       }).toList();
-
-      setState(() {
-        _friendRequests = filtered;
-      });
+      if (mounted) setState(() => _friendRequests = filtered);
     } catch (e) {
-      print('加载好友申请失败: $e');
+      debugPrint('加载好友申请失败: $e');
+    }
+  }
+
+  Future<void> _loadGroupRequests() async {
+    try {
+      final groups = await ApiService().getGroups();
+      final incoming = <Map<String, dynamic>>[];
+      for (final group in groups) {
+        try {
+          final data = await ApiService().getGroupRequests(group.id);
+          final raw = data['requests'] ?? data['items'] ?? data['data'];
+          if (raw is! List) continue;
+          for (final item in raw.whereType<Map>()) {
+            final request = Map<String, dynamic>.from(item);
+            final status = '${request['status'] ?? 'pending'}';
+            final requestId = '${request['id'] ?? request['request_id'] ?? ''}';
+            if (status == 'pending' &&
+                requestId.isNotEmpty &&
+                !_processedGroupRequestIds.contains(requestId)) {
+              request['group_id'] ??= group.id;
+              request['group_name'] ??= group.name ?? group.id;
+              incoming.add(request);
+            }
+          }
+        } catch (_) {}
+      }
+      if (mounted) setState(() => _groupRequests = incoming);
+    } catch (_) {}
+  }
+
+  Future<void> _respondGroupRequest(String requestId, bool accept) async {
+    if (requestId.isEmpty) return;
+    try {
+      await ApiService().approveGroupRequest(requestId, accept);
+      if (!mounted) return;
+      setState(() {
+        _processedGroupRequestIds.add(requestId);
+        _groupRequests.removeWhere(
+          (item) => '${item['id'] ?? item['request_id']}' == requestId,
+        );
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(accept ? '已接受群聊申请' : '已拒绝群聊申请')));
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('处理群聊申请失败：$e')));
     }
   }
 
@@ -76,7 +125,8 @@ class _NotificationsPageState extends State<NotificationsPage> {
     try {
       final api = ApiService();
       final data = await api.getNotifications(offset: _offset, limit: _limit);
-      final newNotifs = (data['items'] as List?)
+      final newNotifs =
+          (data['items'] as List?)
               ?.map((e) => NotificationModel.fromJson(e))
               .toList() ??
           [];
@@ -99,9 +149,9 @@ class _NotificationsPageState extends State<NotificationsPage> {
         _isLoadingMore = false;
       });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载通知失败: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('加载通知失败: $e')));
       }
     }
   }
@@ -125,22 +175,23 @@ class _NotificationsPageState extends State<NotificationsPage> {
             targetId: notification.targetId,
             isRead: true,
             createdAt: notification.createdAt,
+            mediaUrls: notification.mediaUrls,
           );
         }
       });
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('操作失败: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('操作失败: $e')));
     }
   }
 
   // ★ 响应好友申请（接受/拒绝）
   Future<void> _respondFriendRequest(String requestId, bool accept) async {
     if (requestId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请求ID无效')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请求ID无效')));
       return;
     }
     try {
@@ -152,15 +203,15 @@ class _NotificationsPageState extends State<NotificationsPage> {
         _friendRequests.removeWhere((r) => r['id'] == requestId);
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(accept ? '已接受好友申请' : '已拒绝')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(accept ? '已接受好友申请' : '已拒绝')));
 
       await _loadNotifications(initial: true);
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('操作失败: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('操作失败: $e')));
     }
   }
 
@@ -179,6 +230,29 @@ class _NotificationsPageState extends State<NotificationsPage> {
     } else {
       return '刚刚';
     }
+  }
+
+  Widget _buildAvatar(String? rawUrl, String? name) {
+    final url = resolveMediaUrl(rawUrl);
+    final fallback = name?.isNotEmpty == true ? name!.substring(0, 1) : '?';
+    if (url.isEmpty) return CircleAvatar(child: Text(fallback));
+    return InkWell(
+      borderRadius: BorderRadius.circular(24),
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => ImageViewer(imageUrl: url)),
+      ),
+      child: ClipOval(
+        child: CachedImage(
+          url,
+          width: 48,
+          height: 48,
+          cacheWidth: 144,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => CircleAvatar(child: Text(fallback)),
+        ),
+      ),
+    );
   }
 
   @override
@@ -200,19 +274,23 @@ class _NotificationsPageState extends State<NotificationsPage> {
               Text(
                 '好友申请 (${_friendRequests.length})',
                 style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 14,
-                    color: Colors.blue),
+                  fontWeight: FontWeight.bold,
+                  fontSize: 14,
+                  color: Colors.blue,
+                ),
               ),
               const Spacer(),
-              const Text('点击操作',
-                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+              const Text(
+                '点击操作',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
             ],
           ),
         ),
       );
       for (var req in _friendRequests) {
-        final fromName = req['from_display_name'] ??
+        final fromName =
+            req['from_display_name'] ??
             req['from_username'] ??
             req['from_uid'] ??
             '未知用户';
@@ -225,18 +303,11 @@ class _NotificationsPageState extends State<NotificationsPage> {
           Card(
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             color: Colors.blue[50],
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
             child: ListTile(
-              leading: CircleAvatar(
-                radius: 20,
-                backgroundImage: avatarUrl != null && avatarUrl.isNotEmpty
-                    ? NetworkImage(avatarUrl)
-                    : null,
-                child: avatarUrl == null || avatarUrl.isEmpty
-                    ? Text(fromName.isNotEmpty ? fromName.substring(0, 1) : '?')
-                    : null,
-              ),
+              leading: _buildAvatar(avatarUrl, fromName),
               title: Text(
                 fromName,
                 style: const TextStyle(fontWeight: FontWeight.bold),
@@ -272,13 +343,69 @@ class _NotificationsPageState extends State<NotificationsPage> {
     }
 
     // ★ 系统通知部分
+    if (_groupRequests.isNotEmpty) {
+      allItems.add(
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          color: Colors.orange[50],
+          child: Row(
+            children: [
+              const Icon(Icons.group_add, color: Colors.orange, size: 18),
+              const SizedBox(width: 8),
+              Text(
+                '群聊申请 (${_groupRequests.length})',
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.orange,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      for (final request in _groupRequests) {
+        final requestId = '${request['id'] ?? request['request_id'] ?? ''}';
+        final fromName =
+            '${request['from_display_name'] ?? request['from_name'] ?? request['from_uid'] ?? '未知用户'}';
+        final groupName =
+            '${request['group_name'] ?? request['group_id'] ?? '群聊'}';
+        allItems.add(
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            color: Colors.orange[50],
+            child: ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.group)),
+              title: Text('$fromName 申请加入 $groupName'),
+              subtitle: Text(request['message']?.toString() ?? '群聊申请'),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.check, color: Colors.green),
+                    onPressed: () => _respondGroupRequest(requestId, true),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.red),
+                    onPressed: () => _respondGroupRequest(requestId, false),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
     allItems.add(
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Text(
           '系统通知 (${_notifications.length})',
           style: const TextStyle(
-              fontWeight: FontWeight.bold, fontSize: 14, color: Colors.grey),
+            fontWeight: FontWeight.bold,
+            fontSize: 14,
+            color: Colors.grey,
+          ),
         ),
       ),
     );
@@ -296,27 +423,71 @@ class _NotificationsPageState extends State<NotificationsPage> {
           Card(
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             color: notification.isRead ? null : Colors.blue[50],
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
             child: ListTile(
-              leading: CircleAvatar(
-                backgroundImage: notification.fromAvatar != null
-                    ? NetworkImage(notification.fromAvatar!)
-                    : null,
-                child: notification.fromAvatar == null
-                    ? Text(notification.fromName?.isNotEmpty == true
-                        ? notification.fromName!.substring(0, 1)
-                        : '?')
-                    : null,
+              leading: _buildAvatar(
+                notification.fromAvatar,
+                notification.fromName,
               ),
               title: Text(
                 notification.title,
                 style: TextStyle(
-                  fontWeight:
-                      notification.isRead ? FontWeight.normal : FontWeight.bold,
+                  fontWeight: notification.isRead
+                      ? FontWeight.normal
+                      : FontWeight.bold,
                 ),
               ),
-              subtitle: Text(notification.body),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(notification.body),
+                  if (notification.mediaUrls.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: SizedBox(
+                        height: 72,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: notification.mediaUrls.length,
+                          separatorBuilder: (_, __) => const SizedBox(width: 6),
+                          itemBuilder: (_, mediaIndex) => InkWell(
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ImageViewer(
+                                  imageUrl: notification.mediaUrls[mediaIndex],
+                                  imageUrls: notification.mediaUrls,
+                                  initialIndex: mediaIndex,
+                                ),
+                              ),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(6),
+                              child: CachedImage(
+                                resolveMediaUrl(
+                                  notification.mediaUrls[mediaIndex],
+                                ),
+                                width: 72,
+                                height: 72,
+                                cacheWidth: 180,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => Container(
+                                  width: 72,
+                                  height: 72,
+                                  color: Colors.grey[200],
+                                  child: const Icon(Icons.broken_image),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
               trailing: Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -328,7 +499,19 @@ class _NotificationsPageState extends State<NotificationsPage> {
                     const Icon(Icons.circle, color: Colors.blue, size: 8),
                 ],
               ),
-              onTap: () => _markRead(notification),
+              onTap: () async {
+                await _markRead(notification);
+                if (!mounted || notification.mediaUrls.isEmpty) return;
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ImageViewer(
+                      imageUrl: notification.mediaUrls.first,
+                      imageUrls: notification.mediaUrls,
+                    ),
+                  ),
+                );
+              },
             ),
           ),
         );
@@ -355,6 +538,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
             onPressed: () {
               _loadNotifications(initial: true);
               _loadFriendRequests();
+              _loadGroupRequests();
             },
           ),
         ],

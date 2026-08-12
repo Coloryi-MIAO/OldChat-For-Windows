@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 
 class AppTheme {
-  static ThemeData build({required bool pink}) {
+  static ThemeData build({
+    required bool pink,
+    String fontFamily = 'HarmonyOS Sans SC',
+  }) {
     final primary = pink ? const Color(0xFFF5A9C0) : const Color(0xFF5AAFE3);
     final secondary = pink ? const Color(0xFFF8C9D7) : const Color(0xFF83C6ED);
     final background = pink ? const Color(0xFFFFF5FA) : const Color(0xFFF3FAFF);
@@ -9,29 +12,57 @@ class AppTheme {
     final border = pink ? const Color(0xFFF4C1D3) : const Color(0xFFB9DFF5);
     final text = pink ? const Color(0xFF5A4050) : const Color(0xFF25445A);
 
+    final baseTextTheme = ThemeData.light().textTheme.apply(
+      bodyColor: text,
+      displayColor: text,
+      fontFamily: fontFamily,
+    );
+    final textTheme = baseTextTheme.copyWith(
+      bodyLarge: baseTextTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w400),
+      bodyMedium: baseTextTheme.bodyMedium?.copyWith(
+        fontWeight: FontWeight.w400,
+      ),
+      bodySmall: baseTextTheme.bodySmall?.copyWith(fontWeight: FontWeight.w400),
+      titleLarge: baseTextTheme.titleLarge?.copyWith(
+        fontWeight: FontWeight.w500,
+      ),
+      titleMedium: baseTextTheme.titleMedium?.copyWith(
+        fontWeight: FontWeight.w500,
+      ),
+      titleSmall: baseTextTheme.titleSmall?.copyWith(
+        fontWeight: FontWeight.w500,
+      ),
+      labelSmall: baseTextTheme.labelSmall?.copyWith(
+        fontWeight: FontWeight.w400,
+      ),
+    );
+
     return ThemeData(
-      fontFamily: 'Microsoft YaHei',
+      fontFamily: fontFamily,
       useMaterial3: true,
       scaffoldBackgroundColor: background,
       primaryColor: primary,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: primary,
-        brightness: Brightness.light,
-      ).copyWith(
-        primary: primary,
-        onPrimary: Colors.white,
-        secondary: secondary,
-        onSecondary: text,
-        surface: surface,
-        onSurface: text,
-        primaryContainer:
-            pink ? const Color(0xFFFFE2EC) : const Color(0xFFDDF1FF),
-        onPrimaryContainer: text,
-        secondaryContainer:
-            pink ? const Color(0xFFFFEEF4) : const Color(0xFFE8F6FF),
-        onSecondaryContainer: text,
-        outline: border,
-      ),
+      colorScheme:
+          ColorScheme.fromSeed(
+            seedColor: primary,
+            brightness: Brightness.light,
+          ).copyWith(
+            primary: primary,
+            onPrimary: Colors.white,
+            secondary: secondary,
+            onSecondary: text,
+            surface: surface,
+            onSurface: text,
+            primaryContainer: pink
+                ? const Color(0xFFFFE2EC)
+                : const Color(0xFFDDF1FF),
+            onPrimaryContainer: text,
+            secondaryContainer: pink
+                ? const Color(0xFFFFEEF4)
+                : const Color(0xFFE8F6FF),
+            onSecondaryContainer: text,
+            outline: border,
+          ),
       appBarTheme: AppBarTheme(
         backgroundColor: primary,
         foregroundColor: Colors.white,
@@ -58,15 +89,13 @@ class AppTheme {
           borderRadius: BorderRadius.circular(18),
           borderSide: BorderSide(color: primary, width: 1.5),
         ),
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 12,
+        ),
         hintStyle: TextStyle(color: text.withOpacity(.55)),
       ),
-      textTheme: ThemeData.light().textTheme.apply(
-            bodyColor: text,
-            displayColor: text,
-            fontFamily: 'Microsoft YaHei',
-          ),
+      textTheme: textTheme,
     );
   }
 }

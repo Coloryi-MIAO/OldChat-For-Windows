@@ -17,6 +17,7 @@ class Message {
   final String? groupId;
   final int? groupSeq;
   final String? threadId;
+  final String? toUid;
   final int? deliveredAt;
   final int? readAt;
   final int readCount;
@@ -38,6 +39,7 @@ class Message {
     this.groupId,
     this.groupSeq,
     this.threadId,
+    this.toUid,
     this.deliveredAt,
     this.readAt,
     this.readCount = 0,
@@ -76,7 +78,9 @@ class Message {
       id: json['id'] ?? '',
       fromUid: json['from_uid'] ?? json['from_ncuid'] ?? '',
       fromNcuid: json['from_ncuid'],
-      body: json['body'] ?? '',
+      body: json['body'] is String
+          ? json['body']
+          : jsonEncode(json['body'] ?? ''),
       msgType: json['msg_type'] ?? json['type'] ??
           (bodyMap?['media_kind'] == 'video' ? 'video' : bodyMap?['media_kind']) ?? 'text',
       mediaUrl: mediaUrl,
@@ -88,6 +92,7 @@ class Message {
       groupId: json['group_id'],
       groupSeq: _toNullableInt(json['group_seq']),
       threadId: json['thread_id'],
+      toUid: json['to_uid']?.toString(),
       deliveredAt: json['delivered_at'],
       readAt: json['read_at'],
       readCount: json['read_count'] ?? 0,
@@ -151,6 +156,7 @@ class Message {
         'group_id': groupId,
         'group_seq': groupSeq,
         'thread_id': threadId,
+        'to_uid': toUid,
         'delivered_at': deliveredAt,
         'read_at': readAt,
         'read_count': readCount,

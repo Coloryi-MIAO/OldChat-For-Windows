@@ -4,10 +4,15 @@ import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import '../utils/constants.dart';
 import '../services/aria2_service.dart';
-import '../services/theme_service.dart';
 import '../services/cache_service.dart';
-import '../services/diagnostics_service.dart';
+import '../services/theme_service.dart';
+import '../services/update_service.dart';
 import '../services/notification_service.dart';
+import '../services/image_cache_service.dart';
+import '../services/diagnostics_service.dart';
+import '../services/auth_service.dart';
+import 'about_page.dart';
+import '../widgets/update_dialog.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -17,170 +22,137 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  final TextEditingController _baseUrlController = TextEditingController();
-  final TextEditingController _aria2EndpointController = TextEditingController();
-  final TextEditingController _aria2SecretController = TextEditingController();
-  bool _isLoading = false;
-  bool _isAria2Loading = false;
-  bool _notificationsEnabled = true;
-  String? _errorMessage;
-  int _cacheBytes = 0;
-  String _cachePath = '';
+  String _cacheSize = '计算中...';
+  bool _showAria2 = false;
+  final _aria2EndpointController = TextEditingController();
+  final _aria2SecretController = TextEditingController();
+
+  // 关闭窗口设置
+  bool _closeConfirmEnabled = true;
+  bool _closeMinimizeToTray = false;
+  bool _desktopNotificationsEnabled = true;
+  bool _autoUpdateEnabled = true;
+  String _apiVersion = Constants.apiVersion;
 
   @override
   void initState() {
     super.initState();
-    _baseUrlController.text = Constants.baseUrl;
-    _loadAria2Settings();
+    _loadSettings();
     _loadCacheInfo();
-    _notificationsEnabled = NotificationService().enabled;
-  }
-
-  Future<void> _loadAria2Settings() async {
-    final settings = await Aria2Service().settings();
-    if (!mounted) return;
-    setState(() {
-      _aria2EndpointController.text = settings['endpoint'] ?? Aria2Service.defaultEndpoint;
-      _aria2SecretController.text = settings['secret'] ?? '';
-    });
-  }
-
-  Future<void> _loadCacheInfo() async {
-    final bytes = await CacheService().sizeBytes();
-    final path = await CacheService().cacheDirectory();
-    if (!mounted) return;
-    setState(() {
-      _cacheBytes = bytes;
-      _cachePath = path;
-    });
-  }
-
-  Future<void> _clearCache() async {
-    await CacheService().clearClientCache();
-    await _loadCacheInfo();
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('客户端缓存已清除')));
-  }
-
-  Future<void> _chooseCacheLocation() async {
-    final path = await FilePicker.getDirectoryPath(dialogTitle: '选择客户端缓存目录');
-    if (path == null || path.trim().isEmpty) return;
-    await CacheService().setCacheLocation(path);
-    await _loadCacheInfo();
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('缓存位置已保存')));
-  }
-
-  Future<void> _clearDns() async {
-    await DiagnosticsService.clearDnsCache();
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已尝试清除系统 DNS 缓存')));
-  }
-
-  Future<void> _saveAria2Settings() async {
-    setState(() => _isAria2Loading = true);
-    try {
-      await Aria2Service().saveSettings(
-        endpoint: _aria2EndpointController.text,
-        secret: _aria2SecretController.text,
-      );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('aria2 设置已保存')));
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存失败: $e')));
-    } finally {
-      if (mounted) setState(() => _isAria2Loading = false);
-    }
   }
 
   @override
   void dispose() {
-    _baseUrlController.dispose();
     _aria2EndpointController.dispose();
     _aria2SecretController.dispose();
     super.dispose();
   }
 
-  Future<void> _saveSettings() async {
-    String url = _baseUrlController.text.trim();
-
-    // 验证：不能为空
-    if (url.isEmpty) {
-      setState(() {
-        _errorMessage = '服务器地址不能为空';
-      });
-      return;
-    }
-
-    // 验证：必须包含协议头
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      setState(() {
-        _errorMessage = '地址必须以 http:// 或 https:// 开头';
-      });
-      return;
-    }
-
-    // 移除末尾斜杠
-    if (url.endsWith('/')) {
-      url = url.substring(0, url.length - 1);
-      _baseUrlController.text = url;
-    }
-
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _isLoading = true;
-      _errorMessage = null;
+      _closeConfirmEnabled = prefs.getBool('close_confirm_enabled') ?? true;
+      _closeMinimizeToTray = prefs.getBool('close_minimize_to_tray') ?? false;
+      _desktopNotificationsEnabled =
+          prefs.getBool(Constants.desktopNotificationsKey) ?? true;
+      _autoUpdateEnabled = prefs.getBool(Constants.autoUpdateKey) ?? true;
+      _apiVersion = prefs.getString(Constants.apiVersionKey) == 'v1'
+          ? 'v1'
+          : 'v2';
+      _showAria2 = prefs.getBool('aria2_show_settings') ?? false;
     });
+    final settings = await Aria2Service().settings();
+    _aria2EndpointController.text =
+        settings['endpoint'] ?? Aria2Service.defaultEndpoint;
+    _aria2SecretController.text = settings['secret'] ?? '';
+  }
 
+  Future<void> _loadCacheInfo() async {
+    final bytes = await CacheService().sizeBytes();
+    final mb = (bytes / (1024 * 1024)).toStringAsFixed(1);
+    final count = await CacheService().count;
+    setState(() => _cacheSize = '$count 个文件，共 $mb MB');
+  }
+
+  Future<void> _clearCache() async {
     try {
-      await Constants.saveBaseUrl(url);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('设置已保存，请重启应用生效')),
-      );
-      // 延迟后退，让用户看到提示
-      Future.delayed(const Duration(milliseconds: 800), () {
-        // 重启应用
-        _restartApp();
-      });
-    } catch (e) {
-      setState(() {
-        _errorMessage = '保存失败: $e';
-        _isLoading = false;
-      });
+      await CacheService().clearClientCache();
+      ImageCacheService.instance.clear();
+      PaintingBinding.instance.imageCache.clear();
+      PaintingBinding.instance.imageCache.clearLiveImages();
+      await _loadCacheInfo();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('缓存已清除'), duration: Duration(seconds: 2)),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('清除缓存失败：$error')));
+      }
     }
   }
 
-  void _restartApp() {
-    // 退出到登录页并重新加载
-    Navigator.pushNamedAndRemoveUntil(
-      context,
-      '/',
-      (route) => false,
+  Future<void> _chooseCacheLocation() async {
+    final result = await FilePicker.getDirectoryPath();
+    if (result != null) {
+      await CacheService().setLocation(result);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('缓存位置已设置为 $result'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _saveAria2Settings() async {
+    await Aria2Service().saveSettings(
+      endpoint: _aria2EndpointController.text,
+      secret: _aria2SecretController.text,
     );
-    // 重新加载应用
-    // 由于 main.dart 中已经在 main() 里加载了 Constants，因此页面会重新获取新的 baseUrl
-    // 但为了完全重启，我们使用一个简单方法：重新 runApp
-    // 由于无法在这里直接 runApp，我们通知用户重启
-    // 或使用上下文重新构建，但更干净的方式是调用 runApp
-    // 这里我们使用一个技巧：跳转到一个空白页再返回，触发重建
-    // 但更简单：提示用户手动重启
-    // 我们已经在上面提示了 "请重启应用生效"
-    // 所以这里只弹窗提示
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Aria2 设置已保存'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _checkUpdate() async {
+    final service = UpdateService();
+    try {
+      final current = await service.currentVersion();
+      final release = await service.available(UpdateChannel.stable);
+      if (!mounted) return;
+      if (release == null) {
+        _showAlert('已是最新版本', '当前版本：$current');
+        return;
+      }
+      await UpdateDialog.show(
+        context,
+        release: release,
+        currentVersion: current,
+      );
+    } catch (error) {
+      if (mounted) _showAlert('检查更新失败', error.toString());
+    }
+  }
+
+  void _showAlert(String title, String message) {
     showDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('需要重启'),
-        content: const Text('服务器地址已修改，请手动重启应用以生效。\n(完全关闭再打开)'),
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              // 返回登录页
-              Navigator.pushNamedAndRemoveUntil(
-                context,
-                '/',
-                (route) => false,
-              );
-            },
-            child: const Text('返回登录'),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('确定'),
           ),
         ],
       ),
@@ -189,145 +161,574 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final primaryColor = Theme.of(context).primaryColor;
+    final primary = Theme.of(context).primaryColor;
+    final theme = Provider.of<AppThemeController>(context);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('设置'),
-        backgroundColor: primaryColor,
-        foregroundColor: Colors.white,
+        backgroundColor: Colors.transparent,
         elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: () => Navigator.pop(context),
-        ),
       ),
-      body: SingleChildScrollView(
-        child: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              '服务器地址',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        children: [
+          _animatedCategory('通用', Icons.tune, [
+            _buildFontSetting(theme, primary),
+            _buildApiVersionSetting(primary),
+          ], 0),
+          const SizedBox(height: 12),
+          _animatedCategory('外观', Icons.palette_outlined, [
+            _buildSwitchTile(
+              icon: Icons.favorite,
+              title: '粉色主题',
+              subtitle: '启用粉色主题配色',
+              value: theme.isPink,
+              onChanged: (v) => theme.setPink(v),
             ),
-            const SizedBox(height: 8),
-            Text(
-              '修改后需要重启应用才能生效',
-              style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+          ], 1),
+          const SizedBox(height: 12),
+          _animatedCategory('通知', Icons.notifications_none, [
+            _buildSwitchTile(
+              icon: Icons.notifications,
+              title: '桌面通知',
+              subtitle: '收到新消息时显示 Windows 通知',
+              value: _desktopNotificationsEnabled,
+              onChanged: (v) async {
+                setState(() => _desktopNotificationsEnabled = v);
+                await NotificationService().setEnabled(v);
+              },
             ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _baseUrlController,
-              decoration: InputDecoration(
-                hintText: '例如: http://60.205.94.101:8080',
-                border: const OutlineInputBorder(),
-                errorText: _errorMessage,
-                prefixIcon: const Icon(Icons.link),
-              ),
-              keyboardType: TextInputType.url,
-              onChanged: (_) {
-                if (_errorMessage != null) {
-                  setState(() {
-                    _errorMessage = null;
+          ], 2),
+          const SizedBox(height: 12),
+          _animatedCategory('窗口', Icons.window, [
+            _buildSwitchTile(
+              icon: Icons.close,
+              title: '关闭时确认',
+              subtitle: '关闭窗口时弹出确认对话框',
+              value: _closeConfirmEnabled,
+              onChanged: (v) {
+                setState(() => _closeConfirmEnabled = v);
+                SharedPreferences.getInstance().then(
+                  (prefs) => prefs.setBool('close_confirm_enabled', v),
+                );
+              },
+            ),
+            if (!_closeConfirmEnabled)
+              _buildChoiceTile(
+                icon: Icons.minimize,
+                title: '关闭操作',
+                subtitle: _closeMinimizeToTray ? '最小化到系统托盘' : '直接退出程序',
+                options: ['直接退出', '最小化到托盘'],
+                selectedIndex: _closeMinimizeToTray ? 1 : 0,
+                onSelected: (index) {
+                  final minimize = index == 1;
+                  setState(() => _closeMinimizeToTray = minimize);
+                  SharedPreferences.getInstance().then((prefs) async {
+                    await prefs.setBool('close_minimize_to_tray', minimize);
+                    await prefs.setString(
+                      'exit_close_action',
+                      minimize ? 'minimize' : 'exit',
+                    );
                   });
+                },
+              ),
+          ], 3),
+          const SizedBox(height: 12),
+          _animatedCategory('存储', Icons.storage, [
+            _buildInfoTile(
+              icon: Icons.cached,
+              title: '缓存大小',
+              subtitle: _cacheSize,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextButton(
+                    onPressed: _clearCache,
+                    child: const Text('清除缓存', style: TextStyle(fontSize: 13)),
+                  ),
+                  TextButton(
+                    onPressed: _chooseCacheLocation,
+                    child: const Text('选择位置', style: TextStyle(fontSize: 13)),
+                  ),
+                ],
+              ),
+            ),
+          ], 4),
+          const SizedBox(height: 12),
+          _animatedCategory('下载', Icons.download, [
+            _buildSwitchTile(
+              icon: Icons.settings_ethernet,
+              title: 'Aria2 设置',
+              subtitle: '显示高级下载设置',
+              value: _showAria2,
+              onChanged: (v) {
+                setState(() => _showAria2 = v);
+                SharedPreferences.getInstance().then(
+                  (prefs) => prefs.setBool('aria2_show_settings', v),
+                );
+              },
+            ),
+            if (_showAria2) ...[
+              _buildTextInputTile(
+                icon: Icons.link,
+                title: '端点',
+                controller: _aria2EndpointController,
+                hint: Aria2Service.defaultEndpoint,
+              ),
+              _buildTextInputTile(
+                icon: Icons.key,
+                title: '密钥',
+                controller: _aria2SecretController,
+                hint: '留空则不使用密钥',
+                obscure: true,
+              ),
+              Padding(
+                padding: const EdgeInsets.only(left: 52, top: 8),
+                child: ElevatedButton.icon(
+                  onPressed: _saveAria2Settings,
+                  icon: const Icon(Icons.save, size: 16),
+                  label: const Text('保存 Aria2 设置'),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 10,
+                    ),
+                    textStyle: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ),
+            ],
+          ], 5),
+          const SizedBox(height: 12),
+          _animatedCategory('信息', Icons.info_outline, [
+            _buildSwitchTile(
+              icon: Icons.system_update_alt,
+              title: '自动检查更新',
+              subtitle: '启动应用后在后台检查新版本',
+              value: _autoUpdateEnabled,
+              onChanged: (value) async {
+                setState(() => _autoUpdateEnabled = value);
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setBool(Constants.autoUpdateKey, value);
+              },
+            ),
+            _buildInfoTile(
+              icon: Icons.update,
+              title: '检查更新',
+              subtitle: '点击检查是否有新版本',
+              onTap: _checkUpdate,
+            ),
+            _buildInfoTile(
+              icon: Icons.bug_report,
+              title: '环境诊断',
+              subtitle: '查看系统环境信息',
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AboutPage()),
+              ),
+            ),
+            _buildInfoTile(
+              icon: Icons.dns,
+              title: 'DNS 缓存',
+              subtitle: '清除系统 DNS 缓存',
+              onTap: () async {
+                await DiagnosticsService.clearDnsCache();
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('DNS 缓存已清除'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
                 }
               },
             ),
-            const SizedBox(height: 24),
-            const Text('外观主题', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Consumer<AppThemeController>(
-              builder: (context, theme, _) => Card(
-                child: SwitchListTile.adaptive(
-                  value: theme.isPink,
-                  onChanged: theme.setPink,
-                  secondary: Icon(
-                    theme.isPink ? Icons.favorite : Icons.water_drop,
-                    color: Theme.of(context).colorScheme.primary,
-                  ),
-                  title: const Text('桃信粉色主题'),
-                  subtitle: Text(theme.isPink ? '当前：桃信风格' : '当前：Blue Archive 蓝色主题'),
+            _buildInfoTile(
+              icon: Icons.logout,
+              title: '退出登录',
+              subtitle: '清除登录状态并返回登录页',
+              danger: true,
+              onTap: () async {
+                await context.read<AuthService>().clear();
+                if (mounted) Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false);
+              },
+            ),
+          ], 6),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  Widget _animatedCategory(
+    String title,
+    IconData icon,
+    List<Widget> children, [
+    int index = 0,
+  ]) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: 260 + index * 55),
+      curve: Curves.easeOutCubic,
+      child: _buildCategory(title, icon, children),
+      builder: (context, value, child) => Opacity(
+        opacity: value,
+        child: Transform.translate(
+          offset: Offset(0, 10 * (1 - value)),
+          child: child,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCategory(String title, IconData icon, List<Widget> children) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: Colors.grey[600]),
+              const SizedBox(width: 6),
+              Text(
+                title,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[700],
                 ),
               ),
+            ],
+          ),
+        ),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).cardColor,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey.withOpacity(0.15)),
             ),
-            const SizedBox(height: 24),
-            const Text('系统通知', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Card(
-              child: SwitchListTile.adaptive(
-                value: _notificationsEnabled,
-                onChanged: (value) async {
-                  await NotificationService().setEnabled(value);
-                  if (mounted) setState(() => _notificationsEnabled = value);
-                },
-                secondary: const Icon(Icons.notifications_active),
-                title: const Text('Windows 系统通知'),
-                subtitle: const Text('收到新消息时显示右下角系统通知'),
-              ),
+            child: Column(children: children),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFontSetting(AppThemeController theme, Color primary) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: primary.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
             ),
-            const SizedBox(height: 24),
-            const Text('aria2 下载引擎', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Text('配置后，文件消息可交给本机 aria2 下载；默认 RPC 地址为 http://127.0.0.1:6800/jsonrpc。', style: TextStyle(fontSize: 13, color: Colors.grey[600])),
-            const SizedBox(height: 12),
-            TextField(controller: _aria2EndpointController, decoration: const InputDecoration(labelText: 'RPC 地址', prefixIcon: Icon(Icons.download_for_offline))),
-            const SizedBox(height: 8),
-            TextField(controller: _aria2SecretController, obscureText: true, decoration: const InputDecoration(labelText: 'RPC 密钥（可选）')),
-            const SizedBox(height: 12),
-            Align(
-              alignment: Alignment.centerRight,
-              child: ElevatedButton.icon(
-                onPressed: _isAria2Loading ? null : _saveAria2Settings,
-                icon: const Icon(Icons.save),
-                label: const Text('保存 aria2 设置'),
-              ),
+            child: Icon(Icons.font_download_outlined, size: 22, color: primary),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '字体',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 2),
+                DropdownButtonFormField<String>(
+                  value: theme.fontFamily,
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  items: const [
+                    DropdownMenuItem(
+                      value: 'HarmonyOS Sans SC',
+                      child: Text('鸿蒙字体'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'Microsoft YaHei',
+                      child: Text('微软雅黑（系统字体）'),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) theme.setFontFamily(value);
+                  },
+                ),
+              ],
             ),
-            const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton(
-                onPressed: _isLoading ? null : _saveSettings,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryColor,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildApiVersionSetting(Color primary) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: primary.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(Icons.api_outlined, size: 22, color: primary),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'API 路径版本',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 2),
+                DropdownButtonFormField<String>(
+                  value: _apiVersion,
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 'v1', child: Text('v1（兼容旧服务端）')),
+                    DropdownMenuItem(value: 'v2', child: Text('v2（新版服务端）')),
+                  ],
+                  onChanged: (value) async {
+                    if (value == null || value == _apiVersion) return;
+                    setState(() => _apiVersion = value);
+                    await Constants.saveApiVersion(value);
+                    if (mounted)
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('API 已切换为 $value，重新进入页面后生效')),
+                      );
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSwitchTile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    final primary = Theme.of(context).primaryColor;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: primary.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 20, color: primary),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
-                child: _isLoading
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Colors.white),
-                      )
-                    : const Text('保存', style: TextStyle(fontSize: 16)),
+                if (subtitle != null)
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey[600],
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Switch(value: value, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChoiceTile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    required List<String> options,
+    required int selectedIndex,
+    required ValueChanged<int> onSelected,
+  }) {
+    final primary = Theme.of(context).primaryColor;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: primary.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 20, color: primary),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                if (subtitle != null)
+                  Text(
+                    subtitle,
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+              ],
+            ),
+          ),
+          SegmentedButton<int>(
+            segments: List.generate(
+              options.length,
+              (i) => ButtonSegment(
+                value: i,
+                label: Text(options[i], style: const TextStyle(fontSize: 12)),
               ),
             ),
-            const SizedBox(height: 24),
-            Center(
-              child: Text(
-                '当前地址: ${Constants.baseUrl}',
-                style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+            selected: {selectedIndex},
+            onSelectionChanged: (v) => onSelected(v.first),
+            style: SegmentedButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoTile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    Widget? trailing,
+    VoidCallback? onTap,
+    bool danger = false,
+  }) {
+    final primary = Theme.of(context).primaryColor;
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: primary.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(icon, size: 20, color: primary),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                      color: danger ? Colors.red : null,
+                    ),
+                  ),
+                  if (subtitle != null)
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey[600],
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
               ),
             ),
-            const SizedBox(height: 24),
-            const Text('客户端缓存', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Text('已缓存大小：${(_cacheBytes / 1024 / 1024).toStringAsFixed(2)} MB'),
-            Text('存储位置：$_cachePath', maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-            const SizedBox(height: 8),
-            Wrap(spacing: 8, children: [
-              OutlinedButton.icon(onPressed: _clearCache, icon: const Icon(Icons.delete_sweep), label: const Text('清除客户端缓存')),
-              OutlinedButton.icon(onPressed: _clearDns, icon: const Icon(Icons.dns), label: const Text('清除系统 DNS 缓存')),
-              OutlinedButton.icon(onPressed: _chooseCacheLocation, icon: const Icon(Icons.folder_open), label: const Text('选择缓存位置')),
-            ]),
+            if (trailing != null) trailing,
+            if (onTap != null)
+              Icon(Icons.chevron_right, size: 20, color: Colors.grey[400]),
           ],
         ),
-        ),
+      ),
+    );
+  }
+
+  Widget _buildTextInputTile({
+    required IconData icon,
+    required String title,
+    required TextEditingController controller,
+    String? hint,
+    bool obscure = false,
+  }) {
+    final primary = Theme.of(context).primaryColor;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: primary.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 20, color: primary),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: TextField(
+              controller: controller,
+              obscureText: obscure,
+              decoration: InputDecoration(
+                labelText: title,
+                hintText: hint,
+                border: const OutlineInputBorder(),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                isDense: true,
+              ),
+              style: const TextStyle(fontSize: 14),
+            ),
+          ),
+        ],
       ),
     );
   }

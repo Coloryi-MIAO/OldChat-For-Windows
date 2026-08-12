@@ -166,25 +166,58 @@ class CacheService {
     return total;
   }
 
+  Future<void> clear() async => clearClientCache();
+
+  Future<int> get count async => await _countFiles();
+
+  Future<int> _calculateSizeBytes() async {
+    final root = await directory();
+    var total = 0;
+    if (!await root.exists()) return 0;
+    await for (final entity in root.list(recursive: true, followLinks: false)) {
+      if (entity is File) total += await entity.length();
+    }
+    return total;
+  }
+
+  Future<int> _countFiles() async {
+    final root = await directory();
+    var total = 0;
+    if (!await root.exists()) return 0;
+    await for (final entity in root.list(recursive: true, followLinks: false)) {
+      if (entity is File) total++;
+    }
+    return total;
+  }
+
   Future<void> clearClientCache() async {
     final prefs = await SharedPreferences.getInstance();
+    final configured = _unprotect(prefs.getString(_locationKey)?.trim() ?? '');
+    final userId = (prefs.getString('user_id') ?? 'guest')
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final roots = <Directory>{
+      Directory(configured.isNotEmpty ? configured : _defaultUserCacheRoot(userId)),
+      Directory(_defaultUserCacheRoot('guest')),
+      Directory(_defaultUserCacheRoot(userId)),
+      await getTemporaryDirectory(),
+      await getApplicationCacheDirectory(),
+    };
+    for (final root in roots) {
+      if (!await root.exists()) continue;
+      await for (final entity in root.list(recursive: true, followLinks: false)) {
+        if (entity is File) {
+          try {
+            await entity.delete();
+          } catch (_) {}
+        }
+      }
+    }
     final keys = prefs.getKeys().where((key) => key.startsWith('oldchat:')).toList();
     for (final key in keys) {
       await prefs.remove(key);
     }
-    final roots = <Directory>[
-      await getTemporaryDirectory(),
-      await getApplicationCacheDirectory(),
-      Directory(_defaultUserCacheRoot('guest').replaceFirst(RegExp(r'[/\\]guest$'), '')),
-    ];
-    for (final directory in roots) {
-      if (!await directory.exists()) continue;
-      await for (final entity in directory.list(recursive: true, followLinks: false)) {
-        if (entity is File) {
-          try { await entity.delete(); } catch (_) {}
-        }
-      }
-    }
+    imageCache.clear();
+    imageCache.clearLiveImages();
   }
 
   Future<String> cacheDirectory({String? userId}) async => (await directory(userId: userId)).path;

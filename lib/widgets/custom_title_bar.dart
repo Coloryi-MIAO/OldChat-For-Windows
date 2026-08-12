@@ -112,41 +112,7 @@ class _CustomTitleBarState extends State<CustomTitleBar> with WindowListener {
                 ),
                 _buildWindowButton(
                   icon: Icons.close,
-                  onPressed: () async {
-                    final ctx = navigatorKey.currentContext;
-                    if (ctx == null) return;
-                    final result = await showDialog<int>(
-                      context: ctx,
-                      barrierDismissible: false,
-                      builder: (dialogContext) => AlertDialog(
-                        title: const Text('退出程序'),
-                        content: const Text('确定要退出程序吗？'),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(dialogContext, 0),
-                            child: const Text('取消'),
-                          ),
-                          TextButton(
-                            onPressed: () async {
-                              Navigator.pop(dialogContext, 1);
-                              await windowManager.hide();
-                            },
-                            child: const Text('最小化到托盘'),
-                          ),
-                          TextButton(
-                            onPressed: () async {
-                              Navigator.pop(dialogContext, 2);
-                              await AuthService().clear();
-                              await windowManager.destroy();
-                              exit(0);
-                            },
-                            child: const Text('退出',
-                                style: TextStyle(color: Colors.red)),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
+                  onPressed: () => windowManager.close(),
                   isHovering: _isHoveringClose,
                   isPressed: _isPressedClose,
                   onHoverChanged: (v) => setState(() => _isHoveringClose = v),

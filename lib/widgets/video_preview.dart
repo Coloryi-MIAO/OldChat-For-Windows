@@ -1,13 +1,16 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:chewie/chewie.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:flutter/foundation.dart';
+import 'download_progress_dialog.dart';
 
 import '../services/auth_service.dart';
 import '../services/download_service.dart';
 import '../services/image_cache_service.dart';
+import '../services/video_cache_service.dart';
 import '../utils/url_helper.dart';
 
 class VideoPreview extends StatefulWidget {
@@ -71,13 +74,20 @@ class _VideoPreviewState extends State<VideoPreview> {
     }
 
     try {
+      final cache = VideoCacheService();
+      final localFile = await cache.getCachedFile(_resolvedUrl);
       final token = AuthService().token;
-      final controller = VideoPlayerController.networkUrl(
-        uri,
-        httpHeaders: token == null || token.isEmpty
-            ? const {}
-            : {'Authorization': 'Bearer $token'},
-      );
+      final controller = localFile != null
+          ? VideoPlayerController.file(localFile)
+          : VideoPlayerController.networkUrl(
+              uri,
+              httpHeaders: token == null || token.isEmpty
+                  ? const <String, String>{}
+                  : <String, String>{'Authorization': 'Bearer $token'},
+            );
+      if (localFile == null) {
+        unawaited(cache.cacheInBackground(_resolvedUrl));
+      }
       await controller.initialize();
       if (!mounted) {
         await controller.dispose();
@@ -162,14 +172,13 @@ class _VideoPreviewState extends State<VideoPreview> {
   }
 
   Future<void> _saveVideo() async {
-    if (_resolvedUrl.isEmpty) return;
-    try {
-      final result = await DownloadService.download(_resolvedUrl, fileName: 'oldchat_video_${DateTime.now().millisecondsSinceEpoch}.mp4');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result.usedAria2 ? '已交给 aria2 下载' : '视频已保存：${result.path}')));
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('视频下载失败：$e')));
-    }
+    if (_resolvedUrl.isEmpty || !mounted) return;
+    await DownloadProgressDialog.show(
+      context,
+      url: _resolvedUrl,
+      fileName: 'oldchat_video_${DateTime.now().millisecondsSinceEpoch}.mp4',
+      title: '下载视频',
+    );
   }
 
   Widget _actions() {

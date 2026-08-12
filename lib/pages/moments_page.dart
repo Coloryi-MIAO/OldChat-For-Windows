@@ -47,6 +47,7 @@ class _MomentsPageState extends State<MomentsPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadMoments();
+    _precacheMomentMedia();
   }
 
   @override
@@ -68,8 +69,27 @@ class _MomentsPageState extends State<MomentsPage>
   @override
   void didPopNext() => _isVisible = true;
 
-  Future<void> _loadMoments({bool initial = false}) async {
-    if (!_isVisible) return;
+  Future<void> _precacheMomentMedia() async {
+    final cached = await CacheService().readJson(
+      CacheService().scoped(
+        context.read<AuthService>().userId ?? 'guest',
+        'moments:${widget.uid ?? 'feed'}',
+      ),
+    );
+    if (cached is! List) return;
+    for (final item in cached.whereType<Map>()) {
+      final moment = Moment.fromJson(Map<String, dynamic>.from(item));
+      for (final url in moment.imageUrls) {
+        final resolved = resolveMediaUrl(url);
+        if (resolved.isNotEmpty) {
+          ImageCacheService.instance.cacheInBackground(resolved);
+        }
+      }
+    }
+  }
+
+  Future<void> _loadMoments({bool initial = true}) async {
+    if (!initial && !_hasMore) return;
 
     if (!initial) {
       if (_isLoadingMore || !_hasMore) return;
@@ -94,17 +114,31 @@ class _MomentsPageState extends State<MomentsPage>
         data = await api.getMoments(offset: _offset, limit: _limit);
       }
       if (data['error'] != null) throw Exception(data['error']);
-      final rawMoments = data['moments'] ?? data['items'] ?? data['list'] ?? data['data'];
+      final rawMoments = data['moments'] ??
+          (data['response'] is Map ? data['response']['moments'] : data['response']) ??
+          (data['data'] is Map ? data['data']['moments'] : data['data']) ??
+          data['items'] ??
+          data['list'] ??
+          data;
       final newMoments = rawMoments is List
           ? rawMoments.whereType<Map>().map((e) => Moment.fromJson(Map<String, dynamic>.from(e))).toList()
-          : <Moment>[];
-      final hasMore = newMoments.length >= _limit;
+          : rawMoments is Map && rawMoments['moments'] is List
+              ? (rawMoments['moments'] as List).whereType<Map>().map((e) => Moment.fromJson(Map<String, dynamic>.from(e))).toList()
+              : <Moment>[];
+      final hasMore = data['has_more'] == true ||
+          data['hasMore'] == true ||
+          (data['pagination'] is Map && data['pagination']['has_more'] == true) ||
+          newMoments.length >= _limit;
+      final merged = initial ? newMoments : <Moment>[..._moments, ...newMoments];
+      final byId = <String, Moment>{};
+      for (final item in merged) {
+        byId[item.id.isEmpty ? '${item.uid}:${item.createdAt}:${item.body}' : item.id] = item;
+      }
+      final uniqueMoments = byId.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
       setState(() {
-        if (initial)
-          _moments = newMoments;
-        else
-          _moments.addAll(newMoments);
+        _moments = uniqueMoments;
         _hasMore = hasMore;
         _offset += newMoments.length;
         _loading = false;
@@ -163,15 +197,40 @@ class _MomentsPageState extends State<MomentsPage>
   }
 
   Future<void> _toggleLike(Moment moment) async {
+    final index = _moments.indexWhere((item) => item.id == moment.id);
+    if (index == -1) return;
+    final nextLiked = !moment.isLiked;
+    final updated = Moment(
+      id: moment.id,
+      uid: moment.uid,
+      username: moment.username,
+      displayName: moment.displayName,
+      avatarUrl: moment.avatarUrl,
+      body: moment.body,
+      imageUrl: moment.imageUrl,
+      imageUrls: moment.imageUrls,
+      likes: nextLiked ? moment.likes + 1 : (moment.likes - 1).clamp(0, 1 << 30),
+      comments: moment.comments,
+      isLiked: nextLiked,
+      createdAt: moment.createdAt,
+      commentList: moment.commentList,
+    );
+    setState(() => _moments[index] = updated);
     try {
       final api = ApiService();
-      if (moment.isLiked) {
-        await api.unlikeMoment(moment.id);
-      } else {
+      if (nextLiked) {
         await api.likeMoment(moment.id);
+      } else {
+        await api.unlikeMoment(moment.id);
       }
-      await _loadMoments(initial: true);
+      final userId = context.read<AuthService>().userId ?? 'guest';
+      await CacheService().writeJson(
+        CacheService().scoped(userId, 'moments:${widget.uid ?? 'feed'}'),
+        _moments.map((item) => item.toJson()).toList(),
+      );
     } catch (e) {
+      if (!mounted) return;
+      setState(() => _moments[index] = moment);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('操作失败: $e')),
       );
@@ -258,16 +317,15 @@ class _MomentsPageState extends State<MomentsPage>
     );
   }
 
-  void _showImageGallery(List<String> urls, {int initialIndex = 0}) {
-    if (urls.length == 1) {
-      _showImage(urls.first);
-      return;
-    }
+  void _showImageGallery(List<String> urls, {required int initialIndex}) {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            _MomentGalleryPage(urls: urls, initialIndex: initialIndex),
+        builder: (_) => ImageViewer(
+          imageUrl: urls[initialIndex],
+          imageUrls: urls,
+          initialIndex: initialIndex,
+        ),
       ),
     );
   }
@@ -375,9 +433,7 @@ class _MomentsPageState extends State<MomentsPage>
                               'file': await MultipartFile.fromFile(file.path),
                             });
                             final result = await api.uploadFile(formData);
-                            final url =
-                                (result['url'] ?? result['data']?['url'])
-                                    ?.toString();
+                            final url = ApiService.extractUploadUrl(result);
                             if (url == null || url.isEmpty) {
                               throw Exception('图片上传失败');
                             }
@@ -421,7 +477,7 @@ class _MomentsPageState extends State<MomentsPage>
             'file': await MultipartFile.fromFile(file.path),
           });
           final result = await api.uploadFile(formData);
-          final url = (result['url'] ?? result['data']?['url'])?.toString();
+          final url = ApiService.extractUploadUrl(result);
           if (url == null || url.isEmpty) throw Exception('图片上传失败');
           imageUrls.add(url);
         }
@@ -803,9 +859,16 @@ class _MomentsPageState extends State<MomentsPage>
   }
 
   Widget _buildMomentImageGrid(List<String> urls) {
-    final count = urls.length;
-    final height = count == 1 ? 220.0 : (count <= 3 ? 150.0 : 210.0);
+    final normalized = urls
+        .map(resolveMediaUrl)
+        .where((url) => url.isNotEmpty)
+        .toList(growable: false);
+    if (normalized.isEmpty) return const SizedBox.shrink();
+    final count = normalized.length;
+    final visibleCount = count > 9 ? 9 : count;
     final columns = count == 1 ? 1 : 3;
+    final rows = count == 1 ? 1 : ((visibleCount + columns - 1) ~/ columns);
+    final height = count == 1 ? 220.0 : (rows * 112.0) + ((rows - 1) * 4.0);
     return SizedBox(
       height: height,
       child: GridView.builder(
@@ -816,18 +879,39 @@ class _MomentsPageState extends State<MomentsPage>
           mainAxisSpacing: 4,
           childAspectRatio: count == 1 ? 1.7 : 1,
         ),
-        itemCount: urls.length,
+        itemCount: visibleCount,
         itemBuilder: (_, index) => GestureDetector(
-          onTap: () => _showImageGallery(urls, initialIndex: index),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: Image(image: ImageCacheService.instance.provider(resolveMediaUrl(urls[index]), cacheWidth: 720),
-              fit: BoxFit.cover,
-              errorBuilder: (_, __, ___) => Container(
-                color: Colors.grey[200],
-                child: const Icon(Icons.broken_image),
+          onTap: () => _showImageGallery(normalized, initialIndex: index),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: CachedImage(
+                  normalized[index],
+                  width: double.infinity,
+                  height: double.infinity,
+                  cacheWidth: count == 1 ? 960 : 360,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                    color: Colors.grey[200],
+                    child: const Icon(Icons.broken_image),
+                  ),
+                ),
               ),
-            ),
+              if (index == 8 && count > 9)
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    '+${count - 9}',
+                    style: const TextStyle(color: Colors.white, fontSize: 22),
+                  ),
+                ),
+            ],
           ),
         ),
       ),
@@ -955,7 +1039,7 @@ class _MomentGalleryPageState extends State<_MomentGalleryPage> {
   @override
   void initState() {
     super.initState();
-    _currentIndex = widget.initialIndex;
+    _currentIndex = widget.initialIndex.clamp(0, widget.urls.length - 1);
     _controller = PageController(initialPage: _currentIndex);
   }
 
@@ -980,14 +1064,17 @@ class _MomentGalleryPageState extends State<_MomentGalleryPage> {
         onPageChanged: (index) => setState(() => _currentIndex = index),
         itemBuilder: (_, index) => InteractiveViewer(
           child: Center(
-            child: Image(
-              image: ImageCacheService.instance.provider(resolveMediaUrl(widget.urls[index]), cacheWidth: 1400),
+            child: CachedImage(
+              resolveMediaUrl(widget.urls[index]),
+              width: double.infinity,
+              height: double.infinity,
+              cacheWidth: 1400,
               fit: BoxFit.contain,
-              errorBuilder: (_, __, ___) =>
-                  const Icon(Icons.broken_image, color: Colors.white, size: 64),
-              loadingBuilder: (_, child, progress) => progress == null
-                  ? child
-                  : const CircularProgressIndicator(color: Colors.white),
+              errorBuilder: (_, __, ___) => const Icon(
+                Icons.broken_image,
+                color: Colors.white,
+                size: 64,
+              ),
             ),
           ),
         ),

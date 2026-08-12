@@ -1,9 +1,18 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
+import 'package:dio/dio.dart';
 
 import 'auth_service.dart';
+import 'cache_service.dart';
 
 class ImageCacheService {
   static final ImageCacheService instance = ImageCacheService._();
+  final Dio _dio = Dio(
+    BaseOptions(receiveTimeout: const Duration(seconds: 45)),
+  );
 
   static void configure() {
     imageCache.maximumSize = 300;
@@ -13,16 +22,110 @@ class ImageCacheService {
   ImageCacheService._();
 
   ImageProvider provider(String url, {int cacheWidth = 512}) {
+    final normalized = url.trim();
     final token = AuthService().token;
     final headers = token == null || token.isEmpty
         ? null
         : <String, String>{'Authorization': 'Bearer $token'};
-    final image = NetworkImage(url, headers: headers);
-    return ResizeImage(image, width: cacheWidth);
+    return ResizeImage(
+      NetworkImage(normalized, headers: headers),
+      width: cacheWidth,
+    );
+  }
+
+  Future<ImageProvider> cachedProvider(String url, {int cacheWidth = 512}) async {
+    final normalized = url.trim();
+    if (normalized.isEmpty) return const AssetImage('assets/app_icon.png');
+    final file = await cachedFile(normalized);
+    if (file != null && await file.exists()) {
+      return ResizeImage(FileImage(file), width: cacheWidth);
+    }
+    return provider(normalized, cacheWidth: cacheWidth);
+  }
+
+  Future<File?> cachedFile(String url) async {
+    final normalized = url.trim();
+    if (normalized.isEmpty) return null;
+    final existing = await existingFile(normalized);
+    if (existing != null) return existing;
+    final uid = AuthService().userId ?? 'guest';
+    final directory = await CacheService().directory(userId: uid);
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}media_${_key(normalized)}',
+    );
+    if (await file.exists() && await file.length() > 0) return file;
+    try {
+      final token = AuthService().token;
+      final response = await _dio.get<List<int>>(
+        normalized,
+        options: Options(
+          followRedirects: true,
+          validateStatus: (status) => status != null && status < 400,
+          responseType: ResponseType.bytes,
+          headers: token == null || token.isEmpty
+              ? null
+              : {'Authorization': 'Bearer $token'},
+        ),
+      );
+      final bytes = response.data;
+      final contentType = response.headers.value(Headers.contentTypeHeader)?.toLowerCase() ?? '';
+      if (bytes == null || bytes.isEmpty || contentType.contains('text/html') || contentType.contains('application/json')) return null;
+      await file.writeAsBytes(bytes, flush: true);
+      return file;
+    } catch (error) {
+      debugPrint('[图片慢] 持久化缓存失败 $normalized $error');
+      return null;
+    }
+  }
+
+  Future<File?> existingFile(String url) async {
+    final normalized = url.trim();
+    if (normalized.isEmpty) return null;
+    final uid = AuthService().userId ?? 'guest';
+    final directory = await CacheService().directory(userId: uid);
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}media_${_key(normalized)}',
+    );
+    if (await file.exists() && await file.length() > 0) return file;
+    return null;
+  }
+
+  Future<void> cacheInBackground(String url) async {
+    try {
+      await cachedFile(url);
+    } catch (error) {
+      debugPrint('[图片慢] 后台缓存失败 ${url.trim()} $error');
+    }
+  }
+
+  Future<dynamic> readJsonCache(String key) async {
+    try {
+      final uid = AuthService().userId ?? 'guest';
+      return await CacheService().readJson(CacheService().scoped(uid, key));
+    } catch (error) {
+      debugPrint('[缓存] 读取 JSON 失败 $key $error');
+      return null;
+    }
+  }
+
+  Future<void> writeJsonCache(String key, Object value) async {
+    try {
+      final uid = AuthService().userId ?? 'guest';
+      await CacheService().writeJson(CacheService().scoped(uid, key), value);
+    } catch (error) {
+      debugPrint('[缓存] 写入 JSON 失败 $key $error');
+    }
+  }
+
+  String _key(String value) {
+    final encoded = base64UrlEncode(utf8.encode(value)).replaceAll('=', '');
+    return encoded.length > 120 ? encoded.substring(0, 120) : encoded;
   }
 
   void clear() {
     imageCache.clear();
     imageCache.clearLiveImages();
   }
+
+  void clearMemoryCache() => clear();
 }
