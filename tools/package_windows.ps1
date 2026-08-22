@@ -9,10 +9,11 @@ flutter build windows --release
 $bundle = 'build/windows/x64/runner/Release'
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Copy-Item -Recurse -Force "$bundle\*" "$Output\"
-$executable = Join-Path $Output 'runner.exe'
+$builtExecutables = @(Get-ChildItem -Path $Output -Filter '*.exe' -File)
+if ($builtExecutables.Count -eq 0) { throw "Flutter Windows executable was not produced in: $Output" }
+$executable = $builtExecutables[0].FullName
 $namedExecutable = Join-Path $Output "OldChatForAllPlatformwindows$Architecture.exe"
-if (-not (Test-Path $executable)) { throw "Flutter Windows executable was not produced: $executable" }
-Move-Item -Force $executable $namedExecutable
+if ($executable -ne $namedExecutable) { Move-Item -Force $executable $namedExecutable }
 & "$root\tools\sign_windows.ps1" -Output $Output
 $zip = "OldChatForAllPlatformwindows$Architecture.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
