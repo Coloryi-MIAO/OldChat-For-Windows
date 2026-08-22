@@ -1739,7 +1739,11 @@ class _ChatPageState extends State<ChatPage>
       final drop = GetClipboardData(CF_HDROP);
       if (drop == 0) return const <String>[];
       const allFiles = 0xFFFFFFFF;
-      final count = DragQueryFile(
+      final dragQueryFile = DynamicLibrary.open('shell32.dll').lookupFunction<
+        Uint32 Function(IntPtr, Uint32, Pointer<Utf16>, Uint32),
+        int Function(int, int, Pointer<Utf16>, int)
+      >('DragQueryFileW');
+      final count = dragQueryFile(
         drop,
         allFiles,
         nullptr,
@@ -1747,7 +1751,7 @@ class _ChatPageState extends State<ChatPage>
       );
       final paths = <String>[];
       for (var index = 0; index < count; index++) {
-        final length = DragQueryFile(
+        final length = dragQueryFile(
           drop,
           index,
           nullptr,
@@ -1755,7 +1759,7 @@ class _ChatPageState extends State<ChatPage>
         );
         final buffer = calloc<Uint16>(length + 1);
         try {
-          DragQueryFile(drop, index, buffer.cast<Utf16>(), length + 1);
+          dragQueryFile(drop, index, buffer.cast<Utf16>(), length + 1);
           final path = buffer.cast<Utf16>().toDartString();
           if (path.isNotEmpty) paths.add(path);
         } finally {
