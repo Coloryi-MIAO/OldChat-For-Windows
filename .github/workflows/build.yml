@@ -1,0 +1,52 @@
+name: Build OldChat Windows 7
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.19.6'
+
+jobs:
+  analyze-and-test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze lib test --no-fatal-infos --no-fatal-warnings
+      - run: flutter test
+
+  build-windows7-x64:
+    needs: analyze-and-test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Build Windows 7 x64
+        shell: pwsh
+        run: ./tools/package_windows.ps1 -Architecture 'x64' -Output 'dist/windows7x64'
+      - name: Verify Windows 7 package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/windows7x64/OldChatForAllPlatformwindowsx64.exe')) { throw 'Windows 7 executable was not produced' }
+          Get-Item 'dist/windows7x64/OldChatForAllPlatformwindowsx64.exe'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oldchatwindows7x64
+          path: dist/windows7x64
