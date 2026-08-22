@@ -26,7 +26,7 @@ dependencies:
   package_info_plus: ^10.2.1
   webview_flutter: ^4.8.0
   webview_windows: ^0.4.0
-  video_player: ^2.13.0
+  video_player: ^2.8.7
   chewie: ^1.7.5
   video_player_media_kit: ^2.0.0
   media_kit: ^1.2.6
