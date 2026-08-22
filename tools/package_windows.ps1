@@ -1,18 +1,12 @@
 param(
-  [Parameter(Mandatory = $true)][ValidateSet('x64', 'arm64')][string]$Architecture,
+  [Parameter(Mandatory = $true)][ValidateSet('x64')][string]$Architecture,
   [Parameter(Mandatory = $true)][string]$Output
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
-if ($Architecture -eq 'arm64') {
-  if ($env:RUNNER_ARCH -ne 'ARM64') { throw 'Windows ARM64 packaging must run on the windows-11-arm GitHub runner.' }
-  flutter build windows --release
-  $bundle = 'build/windows/arm64/runner/Release'
-} else {
-  flutter build windows --release
-  $bundle = 'build/windows/x64/runner/Release'
-}
+flutter build windows --release
+$bundle = 'build/windows/x64/runner/Release'
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Copy-Item -Recurse -Force "$bundle\*" "$Output\"
 & "$root\tools\sign_windows.ps1" -Output $Output
