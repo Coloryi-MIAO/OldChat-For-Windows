@@ -29,7 +29,7 @@ dependencies:
   video_player: ^2.8.7
   chewie: ^1.7.5
   video_player_media_kit: ^1.0.0
-  media_kit: ^1.2.6
+  media_kit: 1.1.11
   media_kit_video: ^1.2.5
   media_kit_libs_windows_video: ^1.0.11
   win32: ^5.5.0
