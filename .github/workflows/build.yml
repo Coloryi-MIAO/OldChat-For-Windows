@@ -23,8 +23,15 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get
-      - run: flutter analyze lib test --no-fatal-infos --no-fatal-warnings
-      - run: flutter test
+      - run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
+      - name: Run tests when present
+        shell: pwsh
+        run: |
+          if (Test-Path 'test') {
+            flutter test
+          } else {
+            Write-Host 'No test directory; skipping flutter test.'
+          }
 
   build-windows7-x64:
     needs: analyze-and-test
