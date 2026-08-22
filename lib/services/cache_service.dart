@@ -34,11 +34,11 @@ class CacheService {
       bytes.asTypedList(input.length).setAll(0, input);
       inBlob.ref.cbData = input.length;
       inBlob.ref.pbData = bytes;
-      if (!CryptProtectData(inBlob, null, null, null, 0, outBlob).value) return value;
+      if (CryptProtectData(inBlob, nullptr, nullptr, nullptr, nullptr, 0, outBlob) == 0) return value;
       final protectedBytes = outBlob.ref.pbData.asTypedList(outBlob.ref.cbData);
       return _encryptedMarker + base64Encode(protectedBytes);
     } finally {
-      if (outBlob.ref.pbData != nullptr) LocalFree(HLOCAL(outBlob.ref.pbData));
+      if (outBlob.ref.pbData != nullptr) LocalFree(outBlob.ref.pbData);
       calloc.free(bytes);
       calloc.free(inBlob);
       calloc.free(outBlob);
@@ -55,10 +55,10 @@ class CacheService {
       bytes.asTypedList(input.length).setAll(0, input);
       inBlob.ref.cbData = input.length;
       inBlob.ref.pbData = bytes;
-      if (!CryptUnprotectData(inBlob, null, null, null, 0, outBlob).value) return '';
+      if (CryptUnprotectData(inBlob, nullptr, nullptr, nullptr, nullptr, 0, outBlob) == 0) return '';
       return utf8.decode(outBlob.ref.pbData.asTypedList(outBlob.ref.cbData));
     } finally {
-      if (outBlob.ref.pbData != nullptr) LocalFree(HLOCAL(outBlob.ref.pbData));
+      if (outBlob.ref.pbData != nullptr) LocalFree(outBlob.ref.pbData);
       calloc.free(bytes);
       calloc.free(inBlob);
       calloc.free(outBlob);

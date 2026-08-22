@@ -267,8 +267,8 @@ class _ResourcePlazaPageState extends State<ResourcePlazaPage> {
   }
 
   Future<void> _upload() async {
-    final result = await FilePicker.pickFile();
-    final path = result?.path;
+    final result = await FilePicker.platform.pickFiles(allowMultiple: false);
+    final path = result?.files.single.path;
     if (path == null || path.isEmpty) return;
     setState(() => _uploading = true);
     try {

@@ -385,7 +385,7 @@ class _AIChatPageState extends State<AIChatPage> with WidgetsBindingObserver {
           SizedBox(
             width: 220,
             child: DecoratedBox(
-              decoration: BoxDecoration(color: primaryColor.withValues(alpha: 0.08), border: Border(right: BorderSide(color: primaryColor.withValues(alpha: 0.18)))),
+              decoration: BoxDecoration(color: primaryColor.withOpacity(0.08), border: Border(right: BorderSide(color: primaryColor.withOpacity(0.18)))),
               child: Column(
                 children: [
                   ListTile(title: const Text('AI 会话'), trailing: IconButton(icon: const Icon(Icons.add), onPressed: _newSession)),

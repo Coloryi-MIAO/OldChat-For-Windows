@@ -59,12 +59,11 @@ class _DownloadDialogState extends State<DownloadDialog> {
         widget.url,
         fileName: widget.fileName,
         cancelToken: _cancelToken,
-        useAria2: false,
-        onProgress: (received, total) {
+                onProgress: (progress) {
           if (!mounted) return;
           setState(() {
-            _received = received;
-            _total = total;
+            _received = progress.received;
+            _total = progress.total;
           });
         },
       );

@@ -109,7 +109,7 @@ class DownloadService {
   static Future<String?> saveWithDialog(String path, {String? fileName}) async {
     final source = File(path);
     if (!await source.exists()) throw Exception('下载文件不存在');
-    final selected = await FilePicker.saveFile(
+    final selected = await FilePicker.platform.saveFile(
       dialogTitle: '保存文件',
       fileName: fileNameFromMessage(fileName, path),
       bytes: await source.readAsBytes(),

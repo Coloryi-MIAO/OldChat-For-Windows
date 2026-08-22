@@ -1298,8 +1298,8 @@ class _ChatPageState extends State<ChatPage>
       if (shouldSend) await _sendFriendRequest(widget.conversationId);
       return;
     }
-    final result = await FilePicker.pickFile();
-    final path = result?.path;
+    final result = await FilePicker.platform.pickFiles(allowMultiple: false);
+    final path = result?.files.single.path;
     if (path != null && path.isNotEmpty)
       await _sendMediaFile(File(path), 'file');
   }
@@ -1615,8 +1615,8 @@ class _ChatPageState extends State<ChatPage>
               title: const Text('文件'),
               onTap: () async {
                 Navigator.pop(context);
-                final result = await FilePicker.pickFile();
-                final path = result?.path;
+                final result = await FilePicker.platform.pickFiles(allowMultiple: false);
+                final path = result?.files.single.path;
                 if (path != null && path.isNotEmpty) {
                   await _sendMediaFile(File(path), 'file');
                 }
@@ -1732,18 +1732,17 @@ class _ChatPageState extends State<ChatPage>
 
   Future<List<String>> _clipboardFilePaths() async {
     if (!Platform.isWindows) return const <String>[];
-    final opened = OpenClipboard(HWND(Pointer.fromAddress(0))).value;
-    if (!opened) return const <String>[];
+    final opened = OpenClipboard(0);
+    if (opened == 0) return const <String>[];
     try {
-      if (!IsClipboardFormatAvailable(CF_HDROP).value) return const <String>[];
-      final raw = GetClipboardData(CF_HDROP).value;
-      final drop = HDROP(raw);
-      if (!drop.isValid) return const <String>[];
+      if (IsClipboardFormatAvailable(CF_HDROP) == 0) return const <String>[];
+      final drop = GetClipboardData(CF_HDROP);
+      if (drop == 0) return const <String>[];
       const allFiles = 0xFFFFFFFF;
       final count = DragQueryFile(
         drop,
         allFiles,
-        PWSTR(Pointer<Utf16>.fromAddress(0)),
+        nullptr,
         0,
       );
       final paths = <String>[];
@@ -1751,13 +1750,13 @@ class _ChatPageState extends State<ChatPage>
         final length = DragQueryFile(
           drop,
           index,
-          PWSTR(Pointer<Utf16>.fromAddress(0)),
+          nullptr,
           0,
         );
         final buffer = calloc<Uint16>(length + 1);
         try {
-          DragQueryFile(drop, index, PWSTR(buffer.cast<Utf16>()), length + 1);
-          final path = PWSTR(buffer.cast<Utf16>()).toDartString();
+          DragQueryFile(drop, index, buffer.cast<Utf16>(), length + 1);
+          final path = buffer.cast<Utf16>().toDartString();
           if (path.isNotEmpty) paths.add(path);
         } finally {
           calloc.free(buffer);
